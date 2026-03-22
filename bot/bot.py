@@ -1,20 +1,21 @@
 """
 bot/bot.py
 ==========
-Main Bot Orchestrator — Matrix Ecosystem Security and Wellness Monitor
+Liberation Bot — Matrix Orchestrator (Agentic Phase I)
 
 This module wires together all subsystems:
   - Matrix client (simplematrixbotlib / matrix-nio) for E2EE messaging
-  - Database layer
-  - Onboarding manager (Phase 1)
-  - Heartbeat monitor (Phase 2)
-  - OSINT verification pipeline (Phase 3)
-  - Consensus manager (Phase 4)
-  - Release manager (Phase 5)
+  - Database layer (chat history + agent queries + DMS tables)
+  - Onboarding manager (Dead Man's Switch Phase 1)
+  - Heartbeat monitor (Dead Man's Switch Phase 2)
+  - OSINT verification pipeline (Dead Man's Switch Phase 3)
+  - Consensus manager (Dead Man's Switch Phase 4)
+  - Release manager (Dead Man's Switch Phase 5)
+  - AgentCore (Kimi K2 via NVIDIA NIM — Phase I Agentic)
   - APScheduler for periodic heartbeat checks
 
-Command Reference:
-  DM Commands (sent directly to the bot):
+Dead Man's Switch Commands (unchanged):
+  DM Commands:
     !register_switch         — Begin the onboarding flow
     !checkin                 — Reset your activity timer
     !my_status               — View your current status
@@ -25,11 +26,21 @@ Command Reference:
     !activate_switch <@user:server>  — Cast a consensus vote
     !cancel_alert <@user:server>     — (Admin) Cancel an active alert
     !help                            — Show command reference
+
+Agentic Commands (NEW — Phase I):
+  Group Room or DM:
+    @bot <question>  — Ask Liberation Bot about Neurowarfare, Havana Syndrome,
+                       AHIs, directed energy weapons, legal options, etc.
+                       Queries the Liberation Archives (NotebookLM).
+    !archives        — Show Liberation Archives topic overview.
 """
 
 import asyncio
+import json
 import logging
 import os
+import re
+import time
 from typing import Optional
 
 import simplematrixbotlib as botlib
@@ -43,6 +54,8 @@ from bot.verification import VerificationPipeline
 from bot.consensus import ConsensusManager
 from bot.release import ReleaseManager
 from osint.scanner import OSINTScanner
+from agent import AgentCore
+from agent.tools import list_liberation_archives_topics
 
 # Load environment variables from .env file
 load_dotenv()
@@ -71,40 +84,51 @@ HOMESERVER_URL = os.getenv("MATRIX_HOMESERVER_URL", "")
 BOT_USER_ID = os.getenv("MATRIX_BOT_USER_ID", "")
 BOT_PASSWORD = os.getenv("MATRIX_BOT_PASSWORD", "")
 GROUP_ROOM_ID = os.getenv("MATRIX_GROUP_ROOM_ID", "")
-DATABASE_PATH = os.getenv("DATABASE_PATH", "./data/wellness_bot.db")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "./data/liberation_bot.db")
 BOT_MASTER_KEY = os.getenv("BOT_MASTER_KEY", "")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS_THRESHOLD", "3"))
 DEFAULT_THRESHOLD_H = int(os.getenv("DEFAULT_MISSING_THRESHOLD_HOURS", "72"))
 HEARTBEAT_INTERVAL_MIN = int(os.getenv("HEARTBEAT_CHECK_INTERVAL_MINUTES", "60"))
 
-HELP_TEXT = """
-**Matrix Wellness Monitor — Command Reference**
+# Regex to detect @bot mentions (case-insensitive)
+BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "liberation-bot")
+_BOT_MENTION_PATTERN = re.compile(
+    r"@(?:bot|liberation[-_]?bot|" + re.escape(BOT_DISPLAY_NAME) + r")\b",
+    re.IGNORECASE,
+)
 
-**DM Commands** (send these directly to the bot in a private message):
+HELP_TEXT = """
+**Liberation Bot — Command Reference**
+
+**Dead Man's Switch (DM Commands):**
 - `!register_switch` — Begin the Dead Man's Switch registration flow.
 - `!checkin` — Reset your activity timer. Use this to confirm you are safe.
 - `!my_status` — View your current registration status and timer.
 - `!update_emergency_data` — Replace your stored emergency data with new content.
 - `!deregister` — Remove your registration and delete all stored data.
 
-**Group Room Commands** (send these in the monitored group room):
+**Dead Man's Switch (Group Room Commands):**
 - `!activate_switch @user:server` — Cast a consensus vote to activate a switch.
 - `!cancel_alert @user:server` — (Admin) Cancel an active missing alert.
+
+**Agentic AI (Group Room or DM):**
+- `@bot <question>` — Ask Liberation Bot about Neurowarfare, Havana Syndrome,
+  AHIs, directed energy weapons, legal options, resources, and more.
+  Queries the **Liberation Archives** knowledge base for grounded answers.
+- `!archives` — Show an overview of the Liberation Archives topics.
 - `!help` — Show this help message.
 
-**How it works:**
-1. Register via DM. Your emergency data is encrypted immediately.
-2. The bot monitors your activity. Any message you send resets your timer.
-3. If you exceed your threshold, automated safety checks run.
-4. If checks find nothing, the group is alerted and can vote to release your data.
-5. Upon consensus, your emergency data is decrypted and posted to the group.
+**Examples:**
+- `@bot What are the symptoms of Havana Syndrome?`
+- `@bot What legal options do AHI victims have in the US?`
+- `@bot Can you summarize the latest research on directed energy weapons?`
 """
 
 
-class WellnessBot:
+class LiberationBot:
     """
-    Top-level orchestrator for the Matrix Wellness Monitor bot.
+    Top-level orchestrator for Liberation Bot (Agentic Phase I).
     """
 
     def __init__(self):
@@ -126,6 +150,9 @@ class WellnessBot:
 
         # --- OSINT Scanner ---
         self.osint_scanner = OSINTScanner(serpapi_key=SERPAPI_KEY or None)
+
+        # --- Agentic Core (Phase I) ---
+        self.agent = AgentCore()
 
         # --- Sub-modules (initialised after DB is ready) ---
         self.onboarding: Optional[OnboardingManager] = None
@@ -232,19 +259,128 @@ class WellnessBot:
         await self.consensus.post_alert(user, summary)
 
     # ------------------------------------------------------------------
+    # Agentic helpers
+    # ------------------------------------------------------------------
+
+    def _is_bot_mention(self, content: str) -> bool:
+        """Return True if the message content mentions the bot."""
+        return bool(_BOT_MENTION_PATTERN.search(content))
+
+    def _extract_query(self, content: str) -> str:
+        """Strip the @bot mention prefix and return the clean query."""
+        query = _BOT_MENTION_PATTERN.sub("", content).strip()
+        query = re.sub(r"^[,:\s]+", "", query).strip()
+        return query
+
+    async def _send_room_message(self, room_id: str, text: str):
+        """Send a message to any room (group or DM)."""
+        try:
+            await self.bot.api.send_markdown_message(room_id, text)
+        except Exception as exc:
+            logger.error("Failed to send message to room %s: %s", room_id, exc)
+
+    async def _handle_agent_query(self, room, message):
+        """
+        Handle a natural language query directed at the bot.
+        Saves the message to chat history, calls the agent, and responds.
+        """
+        sender = message.sender
+        room_id = room.room_id
+        content = message.body if hasattr(message, "body") else str(message)
+        user_query = self._extract_query(content)
+
+        if not user_query:
+            await self._send_room_message(
+                room_id,
+                "Hi! I'm Liberation Bot. Ask me anything about Neurowarfare, "
+                "Havana Syndrome, or AHIs. For example: "
+                "`@bot What are the symptoms of Havana Syndrome?`",
+            )
+            return
+
+        logger.info(
+            "Agent query from %s in %s: %s", sender, room_id, user_query[:100]
+        )
+
+        # Acknowledge the query
+        await self._send_room_message(room_id, "🔍 Searching the Liberation Archives...")
+
+        # Fetch recent chat history for context
+        recent_messages = await self.db.get_recent_messages(room_id, limit=20)
+
+        # Generate the agent response
+        result = await self.agent.generate_response(
+            user_query=user_query,
+            room_id=room_id,
+            sender_id=sender,
+            recent_messages=recent_messages,
+        )
+
+        # Send the response
+        response_text = result["response"]
+        if result.get("notebooklm_response"):
+            response_text += "\n\n*— Sourced from the Liberation Archives*"
+
+        await self._send_room_message(room_id, response_text)
+
+        # Log the interaction to the knowledge base
+        await self.db.log_agent_query(
+            room_id=room_id,
+            user_matrix_id=sender,
+            user_query=user_query,
+            agent_response=result["response"],
+            notebooklm_query=result.get("notebooklm_query"),
+            notebooklm_response=result.get("notebooklm_response"),
+            tool_calls_made=json.dumps(result.get("tool_calls_made", [])),
+            latency_ms=result.get("latency_ms"),
+        )
+        await self.db.log_event(
+            event_type="AGENT_QUERY",
+            actor_matrix_id=sender,
+            note=f"Query: {user_query[:100]} | Tools: {result.get('tool_calls_made', [])}",
+        )
+
+    # ------------------------------------------------------------------
     # Message handlers
     # ------------------------------------------------------------------
 
     def _register_handlers(self):
         """Register all bot message listeners."""
 
-        # ---- Group room: activity tracking ----
+        # ---- ALL messages: save to chat history + heartbeat tracking ----
         @self.bot.listener.on_message_event
         async def on_any_message(room, message):
-            """Track all messages for heartbeat monitoring."""
+            """
+            Track ALL messages for:
+              1. Chat history memory (agent context window)
+              2. Heartbeat monitoring (Dead Man's Switch)
+            """
             sender = message.sender
             if sender == BOT_USER_ID:
                 return
+
+            # Extract message content
+            content = ""
+            if hasattr(message, "body"):
+                content = message.body
+
+            # Save to chat history (all rooms)
+            event_id = getattr(message, "event_id", None) or str(time.time())
+            timestamp_ts = getattr(message, "server_timestamp", None)
+            timestamp_ts = (timestamp_ts / 1000.0) if timestamp_ts else time.time()
+
+            await self.db.save_message(
+                event_id=event_id,
+                room_id=room.room_id,
+                sender_id=sender,
+                content=content,
+                timestamp_ts=timestamp_ts,
+                sender_display_name=(
+                    room.user_name(sender) if hasattr(room, "user_name") else None
+                ),
+            )
+
+            # Heartbeat tracking for registered users in the group room
             if room.room_id == GROUP_ROOM_ID:
                 await self.heartbeat.record_activity(sender)
 
@@ -254,6 +390,24 @@ class WellnessBot:
             match = botlib.MessageMatch(room, message, self.bot, prefix="!")
             if match.is_not_from_this_bot() and match.prefix() and match.command("help"):
                 await self.bot.api.send_markdown_message(room.room_id, HELP_TEXT)
+
+        # ---- Any room: !archives — Liberation Archives overview ----
+        @self.bot.listener.on_message_event
+        async def on_archives(room, message):
+            match = botlib.MessageMatch(room, message, self.bot, prefix="!")
+            if match.is_not_from_this_bot() and match.prefix() and match.command("archives"):
+                await self._send_room_message(room.room_id, "🔍 Fetching Liberation Archives overview...")
+                overview = await list_liberation_archives_topics()
+                await self._send_room_message(room.room_id, overview)
+
+        # ---- Any room: @bot <query> — agentic AI response ----
+        @self.bot.listener.on_message_event
+        async def on_agent_mention(room, message):
+            if message.sender == BOT_USER_ID:
+                return
+            content = message.body if hasattr(message, "body") else ""
+            if self._is_bot_mention(content):
+                await self._handle_agent_query(room, message)
 
         # ---- Group room: !activate_switch ----
         @self.bot.listener.on_message_event
@@ -474,7 +628,7 @@ class WellnessBot:
 
     async def run(self):
         """Connect to the database, initialise modules, and start the bot."""
-        logger.info("=== Matrix Wellness Monitor starting up ===")
+        logger.info("=== Liberation Bot (Agentic Phase I) starting up ===")
 
         # Connect database
         await self.db.connect()
@@ -500,7 +654,7 @@ class WellnessBot:
 
 def main():
     """Entry point for running the bot."""
-    bot = WellnessBot()
+    bot = LiberationBot()
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:

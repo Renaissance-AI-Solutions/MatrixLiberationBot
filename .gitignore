@@ -1,0 +1,10 @@
+
+# Agentic Phase I
+.env
+data/
+*.db
+*.log
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/

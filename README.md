@@ -1,84 +1,175 @@
-# Matrix Ecosystem Security and Wellness Monitor
+# Liberation Bot — Agentic Phase I
 
-A highly secure, privacy-first AI agent designed to act as an automated "Dead Man's Switch" and wellness monitor for group members within the Element/Matrix ecosystem.
+**An activist intelligence assistant for victims of Neurowarfare, Havana Syndrome, and Anomalous Health Incidents (AHIs).**
 
-## Features
+Built by the [NeuroPsychological Warfare Alliance (NPWA)](https://github.com/Renaissance-AI-Solutions) on the Matrix/Element protocol, powered by **Kimi K2** (via NVIDIA NIM) and grounded in the **Liberation Archives** (Google NotebookLM).
 
-- **End-to-End Encryption (E2EE):** Fully supports Matrix E2EE for all direct messages and group communications.
-- **Secure Data Vaulting:** Emergency data is encrypted immediately upon receipt using AES-256-GCM. The plaintext is never stored on disk or in memory.
-- **Heartbeat Monitoring:** Tracks user activity in the group chat and alerts if a user exceeds their custom "missing" threshold.
-- **Automated OSINT Verification:** Before escalating, the bot ethically checks provided public social media handles and searches local news/obituaries (via SerpAPI) to find legitimate reasons for absence.
-- **Group Consensus Escalation:** If no activity is found, the bot alerts the group. A configurable number of group members must vote (`!activate_switch`) to release the data.
-- **Zero-Knowledge Decryption:** The decryption key is derived at runtime only when group consensus is reached.
+---
 
-## Architecture & Security Model
+## What is Liberation Bot?
 
-- **Database:** SQLite (via `aiosqlite`) storing only ciphertext, IVs, and salts.
-- **Encryption:** `cryptography` library using AES-256-GCM and PBKDF2-HMAC-SHA256.
-- **Matrix Client:** Built on `simplematrixbotlib` and `matrix-nio`.
+Liberation Bot serves two core missions:
 
-## Prerequisites
+1. **Dead Man's Switch (DMS):** A secure, encrypted emergency data release system for activists and victims of Neurowarfare. If a registered user goes missing beyond their configured threshold, the bot triggers an automated safety verification pipeline and, upon group consensus, releases their encrypted emergency data.
 
-- A Matrix homeserver account for the bot.
-- A Matrix group room where the bot is invited and has permission to read messages.
-- Python 3.11+ and `libolm-dev` (for E2EE support).
-- (Optional) A [SerpAPI](https://serpapi.com/) key for news and obituary searches.
+2. **Agentic AI Assistant (Phase I):** A Kimi K2-powered AI agent that answers questions about Havana Syndrome, Neurowarfare, AHIs, and related topics by querying the **Liberation Archives** — a curated NotebookLM knowledge base maintained by NPWA researchers.
 
-## Installation (Docker - Recommended)
+---
 
-1. Clone the repository.
-2. Copy `.env.example` to `.env` and fill in your configuration:
-   ```bash
-   cp .env.example .env
-   ```
-3. Generate a secure 256-bit master key for your `.env` file:
-   ```bash
-   python3 -c "import secrets; print(secrets.token_hex(32))"
-   ```
-4. Build and run using Docker Compose (or standard Docker):
-   ```bash
-   docker build -t matrix-wellness-bot .
-   docker run -d --name wellness-bot --env-file .env -v $(pwd)/data:/app/data matrix-wellness-bot
-   ```
+## Phase I Features
 
-## Installation (Manual)
+| Feature | Description |
+|---|---|
+| **Matrix Chat Memory** | All messages in monitored rooms are stored in a local SQLite database, giving the agent a 90-day rolling context window. |
+| **Liberation Archives** | The agent queries a Google NotebookLM notebook containing verified research on Havana Syndrome, Neurowarfare, and AHIs via `notebooklm-py`. |
+| **Kimi K2 Agent Core** | Powered by `moonshotai/kimi-k2-instruct` (1T MoE, 32B active parameters) via NVIDIA NIM's free OpenAI-compatible API. |
+| **Secure Tool Sandbox** | The agent can ONLY call `query_liberation_archives`. No shell access, no file system access, no vault access. |
+| **Knowledge Base Log** | Every query to the Liberation Archives and every agent response is logged to `agent_queries` for auditability. |
+| **Dead Man's Switch** | All original DMS functionality is fully preserved and unchanged. |
 
-1. Install system dependencies (Ubuntu/Debian):
-   ```bash
-   sudo apt-get install libolm-dev gcc python3-dev
-   ```
-2. Install Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Configure your `.env` file as described above.
-4. Run the bot:
-   ```bash
-   python3 main.py
-   ```
+---
 
-## Usage Guide
+## Architecture
 
-### For Users (Direct Message the Bot)
-- `!register_switch` — Begin the interactive onboarding flow to set your threshold and vault your emergency data.
-- `!checkin` — Manually reset your activity timer.
-- `!my_status` — View your current timer and registration status.
-- `!update_emergency_data` — Replace your vaulted data.
-- `!deregister` — Delete all your data from the bot.
+```
+Matrix Room
+    │
+    ▼
+bot/bot.py ──── on_any_message ──► db.save_message()  [chat_history]
+    │
+    ├── @bot <query> ──► AgentCore.generate_response()
+    │                         │
+    │                         ├── Kimi K2 (NVIDIA NIM)
+    │                         │       └── tool_call: query_liberation_archives()
+    │                         │                   └── NotebookLMClient.chat.ask()
+    │                         │                       [Liberation Archives notebook]
+    │                         └── db.log_agent_query()  [agent_queries]
+    │
+    └── DMS Commands ──► [Unchanged Dead Man's Switch pipeline]
+```
 
-### For the Group (In the Monitored Room)
-- **Activity Tracking:** The bot passively monitors the room. Any message sent by a registered user resets their timer.
-- `!activate_switch @username:server.org` — Cast a vote to activate a missing user's switch.
-- `!cancel_alert @username:server.org` — (Admin) Cancel an active alert if the user is confirmed safe out-of-band.
-- `!help` — Display the command reference.
+---
+
+## Quick Start
+
+### 1. Clone and install
+
+```bash
+git clone https://github.com/Renaissance-AI-Solutions/LiberationBot-Agentic.git
+cd LiberationBot-Agentic
+pip install -r requirements.txt
+```
+
+### 2. Configure
+
+```bash
+cp .env.example .env
+# Edit .env with your values
+```
+
+### 3. Set up NotebookLM authentication
+
+```bash
+pip install notebooklm-py
+notebooklm login   # Opens browser for Google auth
+# Copy ~/.notebooklm/storage_state.json contents into NOTEBOOKLM_AUTH_JSON in .env
+```
+
+### 4. Get your NVIDIA API key
+
+1. Go to [build.nvidia.com/settings/api-keys](https://build.nvidia.com/settings/api-keys)
+2. Create a free API key
+3. Set `NVIDIA_API_KEY=nvapi-...` in `.env`
+
+### 5. Run
+
+```bash
+mkdir -p data
+python3 main.py
+```
+
+---
+
+## Configuration
+
+See `.env.example` for the full reference. Key variables:
+
+| Variable | Required | Description |
+|---|---|---|
+| `MATRIX_BOT_USER_ID` | Yes | Bot's Matrix user ID |
+| `MATRIX_BOT_PASSWORD` | Yes | Bot account password |
+| `MATRIX_HOMESERVER_URL` | Yes | Matrix homeserver URL |
+| `MATRIX_GROUP_ROOM_ID` | Yes | Monitored group room ID |
+| `BOT_MASTER_KEY` | Yes | 64-char hex key for vault encryption |
+| `NVIDIA_API_KEY` | Yes | NVIDIA NIM API key for Kimi K2 |
+| `LIBERATION_ARCHIVES_NOTEBOOK_ID` | Yes | NotebookLM notebook ID |
+| `NOTEBOOKLM_AUTH_JSON` | Yes* | Google session auth JSON |
+
+---
+
+## Usage
+
+### Agentic AI
+
+```
+@bot What are the neurological symptoms of Havana Syndrome?
+@bot What legal options do AHI victims have in the United States?
+@bot What is the Frey effect and how does it relate to AHIs?
+!archives   — Show Liberation Archives topic overview
+!help       — Show full command reference
+```
+
+### Dead Man's Switch (DM the bot)
+
+```
+!register_switch       — Begin registration
+!checkin               — Reset your activity timer
+!my_status             — View your status
+!update_emergency_data — Update your emergency data
+!deregister            — Remove your registration
+```
+
+### Dead Man's Switch (Group room)
+
+```
+!activate_switch @user:server  — Cast a consensus vote
+!cancel_alert @user:server     — Cancel an active alert (admin)
+```
+
+---
+
+## Security Model
+
+- **No shell execution.** The agent cannot call `subprocess`, `os.system`, or any execution primitive.
+- **No file system access.** The agent cannot read or write files on the server.
+- **No vault access.** The agent has no access to the `emergency_vault` table or encrypted user data.
+- **Single tool.** The only tool exposed to the agent is `query_liberation_archives` (read-only HTTP to Google).
+- **Full audit trail.** Every agent interaction is logged to `agent_queries` and `audit_log`.
+
+---
+
+## Phase II Roadmap
+
+- Web search tool (read-only) for real-time news
+- Video generation via NotebookLM audio + video pipeline
+- YouTube / Substack / TikTok publishing
+- FOIA request drafting for victims
+- NPWA advocacy strategy assistant
+
+---
 
 ## Testing
 
-Run the test suite using `pytest`:
 ```bash
 pytest tests/ -v --asyncio-mode=auto
 ```
 
-## Disclaimer
+---
 
-This software is provided as-is. While designed with strict security and privacy constraints, it should not be relied upon as a sole life-safety mechanism. Always ensure trusted individuals have alternative means of accessing critical emergency information.
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+*Built with care for the victims of Neurowarfare and Havana Syndrome. You are not alone.*
