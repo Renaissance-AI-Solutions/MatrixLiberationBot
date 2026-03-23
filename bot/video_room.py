@@ -102,6 +102,10 @@ class VideoRoomHandler:
         elif body == "!video_history":
             await self._cmd_history(room)
 
+        elif body == "!help":
+            from bot.bot import HELP_TEXT
+            await self._send(room.room_id, HELP_TEXT)
+
         elif body.startswith("!"):
             # Unknown command — ignore silently (other bot commands may exist)
             return

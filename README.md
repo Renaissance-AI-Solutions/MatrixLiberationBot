@@ -23,7 +23,8 @@ Liberation Bot serves two core missions:
 | **Matrix Chat Memory** | All messages in monitored rooms are stored in a local SQLite database, giving the agent a 90-day rolling context window. |
 | **Liberation Archives** | The agent queries a Google NotebookLM notebook containing verified research on Havana Syndrome, Neurowarfare, and AHIs via `notebooklm-py`. |
 | **Kimi K2 Agent Core** | Powered by `moonshotai/kimi-k2-instruct` (1T MoE, 32B active parameters) via NVIDIA NIM's free OpenAI-compatible API. |
-| **Secure Tool Sandbox** | The agent can ONLY call `query_liberation_archives`. No shell access, no file system access, no vault access. |
+| **Video Planning Workflow** | A dedicated Matrix room where the bot conducts a natural dialogue with the group to brainstorm, plan, and automatically generate advocacy videos via NotebookLM. |
+| **Secure Tool Sandbox** | The agent can ONLY call `query_liberation_archives` and `submit_video_prompts`. No shell access, no file system access, no vault access. |
 | **Knowledge Base Log** | Every query to the Liberation Archives and every agent response is logged to `agent_queries` for auditability. |
 | **Dead Man's Switch** | All original DMS functionality is fully preserved and unchanged. |
 
@@ -109,7 +110,7 @@ See `.env.example` for the full reference. Key variables:
 
 ## Usage
 
-### Agentic AI
+### Agentic AI (Group Room or DM)
 
 ```
 @bot What are the neurological symptoms of Havana Syndrome?
@@ -117,6 +118,19 @@ See `.env.example` for the full reference. Key variables:
 @bot What is the Frey effect and how does it relate to AHIs?
 !archives   — Show Liberation Archives topic overview
 !help       — Show full command reference
+```
+
+### Video Planning Room (Video Planning and Generation room only)
+
+```
+!video_start              — Begin a new video planning session. The bot will lead a dialogue to build the prompts.
+!video_styles             — List all available visual styles and saved favourites.
+!video_save_style <name>  — Save the current session's style as a reusable named favourite.
+!video_preview            — Show the current prompt preview at any time.
+!video_revise <notes>     — Ask the bot to revise the prompts based on your feedback.
+!video_confirm            — Confirm the prompts and start video generation (any group member).
+!video_cancel             — Cancel the current session.
+!video_history            — Show recent completed videos.
 ```
 
 ### Dead Man's Switch (DM the bot)
@@ -151,8 +165,7 @@ See `.env.example` for the full reference. Key variables:
 ## Phase II Roadmap
 
 - Web search tool (read-only) for real-time news
-- Video generation via NotebookLM audio + video pipeline
-- YouTube / Substack / TikTok publishing
+- YouTube / Substack / TikTok automated publishing
 - FOIA request drafting for victims
 - NPWA advocacy strategy assistant
 
