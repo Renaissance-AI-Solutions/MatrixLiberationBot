@@ -56,6 +56,7 @@ from bot.release import ReleaseManager
 from osint.scanner import OSINTScanner
 from agent import AgentCore
 from agent.tools import list_liberation_archives_topics
+from bot.video_room import VideoRoomHandler
 
 # Load environment variables from .env file
 load_dotenv()
@@ -90,6 +91,7 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS_THRESHOLD", "3"))
 DEFAULT_THRESHOLD_H = int(os.getenv("DEFAULT_MISSING_THRESHOLD_HOURS", "72"))
 HEARTBEAT_INTERVAL_MIN = int(os.getenv("HEARTBEAT_CHECK_INTERVAL_MINUTES", "60"))
+VIDEO_ROOM_ID = os.getenv("MATRIX_VIDEO_ROOM_ID", "")
 
 # Regex to detect @bot mentions (case-insensitive)
 BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "liberation-bot")
@@ -116,13 +118,25 @@ HELP_TEXT = """
 - `@bot <question>` — Ask Liberation Bot about Neurowarfare, Havana Syndrome,
   AHIs, directed energy weapons, legal options, resources, and more.
   Queries the **Liberation Archives** knowledge base for grounded answers.
-- `!archives` — Show an overview of the Liberation Archives topics.
+- `!archives` — Show Liberation Archives topic overview.
 - `!help` — Show this help message.
 
 **Examples:**
 - `@bot What are the symptoms of Havana Syndrome?`
 - `@bot What legal options do AHI victims have in the US?`
 - `@bot Can you summarize the latest research on directed energy weapons?`
+
+**Video Planning Room (Video Planning and Generation room only):**
+- `!video_start` — Open a new video brainstorming session.
+- `!video_title <title>` — Set the video title.
+- `!video_style <name>` — Choose a visual style.
+- `!video_styles` — List all available styles and saved favourites.
+- `!video_save_style <name> [notes]` — Save the current style as a reusable favourite.
+- `!video_prompt <text>` — Set the content prompt for the video.
+- `!video_preview` — Preview the full prompt before generating.
+- `!video_confirm` — Confirm and generate the video via the Liberation Archives.
+- `!video_cancel` — Cancel the current session.
+- `!video_history` — Show recent completed videos.
 """
 
 
@@ -160,6 +174,7 @@ class LiberationBot:
         self.verification: Optional[VerificationPipeline] = None
         self.consensus: Optional[ConsensusManager] = None
         self.release_mgr: Optional[ReleaseManager] = None
+        self.video_handler: Optional[VideoRoomHandler] = None
 
         # --- Scheduler ---
         self.scheduler = AsyncIOScheduler()
@@ -246,6 +261,19 @@ class LiberationBot:
             master_key_hex=BOT_MASTER_KEY,
             default_threshold_h=DEFAULT_THRESHOLD_H,
         )
+
+        # --- Video Planning Room Handler ---
+        if VIDEO_ROOM_ID:
+            self.video_handler = VideoRoomHandler(
+                db=self.db,
+                bot_api=self.bot.api,
+            )
+            logger.info("VideoRoomHandler initialised for room: %s", VIDEO_ROOM_ID)
+        else:
+            logger.warning(
+                "MATRIX_VIDEO_ROOM_ID not set — video planning room disabled. "
+                "Add it to .env to enable the video workflow."
+            )
 
         logger.info("All sub-modules initialised.")
 
@@ -586,11 +614,25 @@ class LiberationBot:
                     "emergency data) have been permanently deleted.",
                 )
 
+        # ---- Video Planning Room: all !video_* commands + brainstorm messages ----
+        @self.bot.listener.on_message_event
+        async def on_video_room_message(room, message):
+            if not VIDEO_ROOM_ID:
+                return
+            if room.room_id != VIDEO_ROOM_ID:
+                return
+            if message.sender == BOT_USER_ID:
+                return
+            if self.video_handler:
+                await self.video_handler.handle_message(room, message)
+
         # ---- DM: Onboarding conversation (catch-all for active sessions) ----
         @self.bot.listener.on_message_event
         async def on_dm_conversation(room, message):
             if room.room_id == GROUP_ROOM_ID:
                 return
+            if room.room_id == VIDEO_ROOM_ID:
+                return  # Video room handled above
             sender = message.sender
             if sender == BOT_USER_ID:
                 return

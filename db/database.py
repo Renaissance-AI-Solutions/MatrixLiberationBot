@@ -11,6 +11,8 @@ Tables:
   - audit_log            : Privacy-safe event log (no plaintext data)
   - chat_history         : [NEW] Full Matrix chat history for agent memory
   - agent_queries        : [NEW] Liberation Archives query/response log
+  - video_sessions       : [NEW] Video planning session archive
+  - video_style_library  : [NEW] Saved reusable visual style prompts
 
 Security note: The agent has READ access to chat_history only.
 It cannot access emergency_vault, and all agent interactions are
@@ -114,6 +116,40 @@ CREATE TABLE IF NOT EXISTS agent_queries (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_queries_user_ts
     ON agent_queries(user_matrix_id, query_ts DESC);
+
+-- [VIDEO] Completed video planning sessions archive
+-- Stores the full record of each brainstorming session and the prompts used.
+CREATE TABLE IF NOT EXISTS video_sessions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_ts          REAL NOT NULL,
+    completed_ts        REAL,
+    room_id             TEXT NOT NULL,
+    started_by          TEXT NOT NULL,
+    title               TEXT,
+    style_key           TEXT,                 -- Key from VIDEO_STYLE_NAMES
+    custom_prompt       TEXT,                 -- Content prompt (without CTA suffix)
+    full_prompt         TEXT,                 -- Full prompt sent to NotebookLM
+    brainstorm_notes    TEXT,                 -- JSON array of brainstorming messages
+    status              TEXT NOT NULL DEFAULT 'IN_PROGRESS'
+                            CHECK(status IN ('IN_PROGRESS','COMPLETED','FAILED','CANCELLED')),
+    notebooklm_task_id  TEXT,
+    video_download_path TEXT,
+    error_note          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_video_sessions_room_ts
+    ON video_sessions(room_id, created_ts DESC);
+
+-- [VIDEO] Saved reusable visual style prompts
+-- Styles that produce high-quality videos are saved here for reuse.
+CREATE TABLE IF NOT EXISTS video_style_library (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,         -- Short memorable name
+    style_key   TEXT NOT NULL,                -- Key from VIDEO_STYLE_NAMES
+    notes       TEXT,                         -- Why this style works well
+    created_by  TEXT NOT NULL,               -- Matrix user ID
+    created_ts  REAL NOT NULL,
+    use_count   INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # How many days of chat history to retain (configurable via env)
@@ -480,3 +516,159 @@ class Database:
         ) as cur:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # [VIDEO] Video Session Archive
+    # ------------------------------------------------------------------
+
+    async def create_video_session(
+        self,
+        room_id: str,
+        started_by: str,
+    ) -> int:
+        """Insert a new IN_PROGRESS video session record. Returns the row ID."""
+        now = datetime.now(timezone.utc).timestamp()
+        async with self._conn.execute(
+            """
+            INSERT INTO video_sessions
+                (created_ts, room_id, started_by, status)
+            VALUES (?, ?, ?, 'IN_PROGRESS')
+            """,
+            (now, room_id, started_by),
+        ) as cur:
+            row_id = cur.lastrowid
+        await self._conn.commit()
+        return row_id
+
+    async def update_video_session(
+        self,
+        session_db_id: int,
+        title: str = None,
+        style_key: str = None,
+        custom_prompt: str = None,
+        full_prompt: str = None,
+        brainstorm_notes_json: str = None,
+        status: str = None,
+        notebooklm_task_id: str = None,
+        video_download_path: str = None,
+        error_note: str = None,
+    ):
+        """Update fields on an existing video session record."""
+        now = datetime.now(timezone.utc).timestamp()
+        fields = []
+        values = []
+
+        if title is not None:
+            fields.append("title = ?"); values.append(title)
+        if style_key is not None:
+            fields.append("style_key = ?"); values.append(style_key)
+        if custom_prompt is not None:
+            fields.append("custom_prompt = ?"); values.append(custom_prompt)
+        if full_prompt is not None:
+            fields.append("full_prompt = ?"); values.append(full_prompt)
+        if brainstorm_notes_json is not None:
+            fields.append("brainstorm_notes = ?"); values.append(brainstorm_notes_json)
+        if status is not None:
+            fields.append("status = ?"); values.append(status)
+            if status in ("COMPLETED", "FAILED", "CANCELLED"):
+                fields.append("completed_ts = ?"); values.append(now)
+        if notebooklm_task_id is not None:
+            fields.append("notebooklm_task_id = ?"); values.append(notebooklm_task_id)
+        if video_download_path is not None:
+            fields.append("video_download_path = ?"); values.append(video_download_path)
+        if error_note is not None:
+            fields.append("error_note = ?"); values.append(error_note)
+
+        if not fields:
+            return
+
+        values.append(session_db_id)
+        await self._conn.execute(
+            f"UPDATE video_sessions SET {', '.join(fields)} WHERE id = ?",
+            values,
+        )
+        await self._conn.commit()
+
+    async def get_recent_video_sessions(
+        self,
+        room_id: str = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Return recent video sessions, optionally filtered by room."""
+        if room_id:
+            sql = """
+                SELECT id, created_ts, completed_ts, room_id, started_by,
+                       title, style_key, status, video_download_path
+                FROM video_sessions
+                WHERE room_id = ?
+                ORDER BY created_ts DESC LIMIT ?
+            """
+            params = (room_id, limit)
+        else:
+            sql = """
+                SELECT id, created_ts, completed_ts, room_id, started_by,
+                       title, style_key, status, video_download_path
+                FROM video_sessions
+                ORDER BY created_ts DESC LIMIT ?
+            """
+            params = (limit,)
+        async with self._conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # [VIDEO] Style Library
+    # ------------------------------------------------------------------
+
+    async def save_style(
+        self,
+        name: str,
+        style_key: str,
+        created_by: str,
+        notes: str = None,
+    ) -> bool:
+        """Save a named style to the library. Returns True on success."""
+        now = datetime.now(timezone.utc).timestamp()
+        try:
+            await self._conn.execute(
+                """
+                INSERT INTO video_style_library
+                    (name, style_key, notes, created_by, created_ts)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    style_key  = excluded.style_key,
+                    notes      = excluded.notes,
+                    created_by = excluded.created_by,
+                    created_ts = excluded.created_ts
+                """,
+                (name, style_key, notes, created_by, now),
+            )
+            await self._conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("save_style failed for %s: %s", name, exc)
+            return False
+
+    async def get_style(self, name: str) -> Optional[Dict[str, Any]]:
+        """Look up a saved style by name."""
+        async with self._conn.execute(
+            "SELECT * FROM video_style_library WHERE name = ?", (name,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def list_styles(self) -> List[Dict[str, Any]]:
+        """Return all saved styles ordered by use count descending."""
+        async with self._conn.execute(
+            "SELECT * FROM video_style_library ORDER BY use_count DESC, name ASC"
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def increment_style_use_count(self, name: str):
+        """Increment the use counter for a saved style."""
+        await self._conn.execute(
+            "UPDATE video_style_library SET use_count = use_count + 1 WHERE name = ?",
+            (name,),
+        )
+        await self._conn.commit()
