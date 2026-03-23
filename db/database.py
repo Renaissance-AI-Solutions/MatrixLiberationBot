@@ -130,8 +130,8 @@ CREATE TABLE IF NOT EXISTS video_sessions (
     custom_prompt       TEXT,                 -- Content prompt (without CTA suffix)
     full_prompt         TEXT,                 -- Full prompt sent to NotebookLM
     brainstorm_notes    TEXT,                 -- JSON array of brainstorming messages
-    status              TEXT NOT NULL DEFAULT 'IN_PROGRESS'
-                            CHECK(status IN ('IN_PROGRESS','COMPLETED','FAILED','CANCELLED')),
+    status              TEXT NOT NULL DEFAULT 'BRAINSTORMING'
+                            CHECK(status IN ('BRAINSTORMING','CONFIRMING','IN_PROGRESS','COMPLETED','FAILED','CANCELLED')),
     notebooklm_task_id  TEXT,
     video_download_path TEXT,
     error_note          TEXT
@@ -526,13 +526,13 @@ class Database:
         room_id: str,
         started_by: str,
     ) -> int:
-        """Insert a new IN_PROGRESS video session record. Returns the row ID."""
+        """Insert a new BRAINSTORMING video session record. Returns the row ID."""
         now = datetime.now(timezone.utc).timestamp()
         async with self._conn.execute(
             """
             INSERT INTO video_sessions
                 (created_ts, room_id, started_by, status)
-            VALUES (?, ?, ?, 'IN_PROGRESS')
+            VALUES (?, ?, ?, 'BRAINSTORMING')
             """,
             (now, room_id, started_by),
         ) as cur:

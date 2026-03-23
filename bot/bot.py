@@ -127,14 +127,12 @@ HELP_TEXT = """
 - `@bot Can you summarize the latest research on directed energy weapons?`
 
 **Video Planning Room (Video Planning and Generation room only):**
-- `!video_start` — Open a new video brainstorming session.
-- `!video_title <title>` — Set the video title.
-- `!video_style <name>` — Choose a visual style.
-- `!video_styles` — List all available styles and saved favourites.
-- `!video_save_style <name> [notes]` — Save the current style as a reusable favourite.
-- `!video_prompt <text>` — Set the content prompt for the video.
-- `!video_preview` — Preview the full prompt before generating.
-- `!video_confirm` — Confirm and generate the video via the Liberation Archives.
+- `!video_start` — Begin a new video planning session. Liberation Bot will lead a dialogue with the group, ask questions, and build the prompts automatically.
+- `!video_styles` — List all available visual styles and saved favourites.
+- `!video_save_style <name> [notes]` — Save the current session's style as a reusable named favourite.
+- `!video_preview` — Show the current prompt preview at any time.
+- `!video_revise <notes>` — Ask the bot to revise the prompts based on your feedback.
+- `!video_confirm` — Confirm the prompts and start video generation (any group member).
 - `!video_cancel` — Cancel the current session.
 - `!video_history` — Show recent completed videos.
 """
