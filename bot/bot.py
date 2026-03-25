@@ -99,6 +99,16 @@ VIDEO_ROOM_ID = os.getenv("MATRIX_VIDEO_ROOM_ID", "")
 DREAM_HOUR_UTC = int(os.getenv("DREAM_HOUR_UTC", "3"))    # 03:00 UTC default
 DREAM_MINUTE_UTC = int(os.getenv("DREAM_MINUTE_UTC", "0"))
 
+# ---------------------------------------------------------------------------
+# Rate limiting — Layer 2: per-user cooldown
+# ---------------------------------------------------------------------------
+# Minimum number of seconds a user must wait between @bot queries.
+# Queries arriving within this window are rejected with a polite message
+# rather than consuming an API slot. This prevents a single user from
+# monopolising the global concurrency semaphore and starving others.
+# Set to 0 to disable per-user cooldown (not recommended on free-tier keys).
+AGENT_USER_COOLDOWN_S = float(os.getenv("AGENT_USER_COOLDOWN_S", "30"))
+
 # Regex to detect @bot mentions (case-insensitive)
 BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "liberation-bot")
 _BOT_MENTION_PATTERN = re.compile(
@@ -183,6 +193,11 @@ class LiberationBot:
         self.consensus: Optional[ConsensusManager] = None
         self.release_mgr: Optional[ReleaseManager] = None
         self.video_handler: Optional[VideoRoomHandler] = None
+
+        # --- Per-user cooldown tracking (in-memory, no DB needed) ---
+        # Maps matrix_id -> monotonic timestamp of their last successful query.
+        # Cleared on bot restart (intentional — cooldowns don't need to survive restarts).
+        self._user_last_query: dict[str, float] = {}
 
         # --- Scheduler ---
         self.scheduler = AsyncIOScheduler()
@@ -326,6 +341,15 @@ class LiberationBot:
         """
         Handle a natural language query directed at the bot.
 
+        Rate limiting (three-layer defence):
+          Layer 2 — Per-user cooldown: reject queries arriving within
+            AGENT_USER_COOLDOWN_S seconds of the user's last successful query.
+            This prevents a single user from monopolising the global semaphore.
+          Layer 1 — Global concurrency semaphore: enforced inside AgentCore.
+            At most AGENT_MAX_CONCURRENT_CALLS LLM requests in-flight at once.
+          Layer 3 — 429 retry-with-backoff: enforced inside AgentCore.
+            Transient NVIDIA throttle responses are retried automatically.
+
         Enriches the agent context with:
           1. Long-term user memories (from Dream consolidation)
           2. Operational memories relevant to this room
@@ -346,6 +370,26 @@ class LiberationBot:
                 "`@bot What are the symptoms of Havana Syndrome?`",
             )
             return
+
+        # ------------------------------------------------------------------
+        # Layer 2: Per-user cooldown check
+        # ------------------------------------------------------------------
+        if AGENT_USER_COOLDOWN_S > 0:
+            now = time.monotonic()
+            last_query_ts = self._user_last_query.get(sender, 0.0)
+            elapsed = now - last_query_ts
+            if elapsed < AGENT_USER_COOLDOWN_S:
+                remaining = int(AGENT_USER_COOLDOWN_S - elapsed) + 1
+                logger.info(
+                    "Agent query from %s rejected: cooldown active (%.1fs remaining).",
+                    sender, AGENT_USER_COOLDOWN_S - elapsed,
+                )
+                await self._send_room_message(
+                    room_id,
+                    f"⏱️ Please wait **{remaining} seconds** before sending another query. "
+                    f"This keeps the AI available for all members.",
+                )
+                return
 
         logger.info(
             "Agent query from %s in %s: %s", sender, room_id, user_query[:100]
@@ -378,6 +422,14 @@ class LiberationBot:
             operational_memories=operational_memories,
         )
 
+        # ------------------------------------------------------------------
+        # Record the cooldown timestamp only on a successful (non-error) call.
+        # If the call failed due to rate limiting or an API error, don't
+        # penalise the user — they should be free to retry immediately.
+        # ------------------------------------------------------------------
+        if not result.get("error"):
+            self._user_last_query[sender] = time.monotonic()
+
         # Send the response
         response_text = result["response"]
         if result.get("notebooklm_response"):
@@ -399,7 +451,11 @@ class LiberationBot:
         await self.db.log_event(
             event_type="AGENT_QUERY",
             actor_matrix_id=sender,
-            note=f"Query: {user_query[:100]} | Tools: {result.get('tool_calls_made', [])}",
+            note=(
+                f"Query: {user_query[:100]} | "
+                f"Tools: {result.get('tool_calls_made', [])} | "
+                f"RateLimited: {result.get('rate_limited', False)}"
+            ),
         )
 
     # ------------------------------------------------------------------

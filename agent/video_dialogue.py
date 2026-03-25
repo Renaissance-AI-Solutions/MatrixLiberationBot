@@ -35,7 +35,10 @@ import logging
 import os
 from typing import Optional, TYPE_CHECKING
 
-from openai import AsyncOpenAI, APIError
+import asyncio
+import time
+
+from openai import AsyncOpenAI, APIError, RateLimitError
 
 from bot.video_session import (
     VideoSession,
@@ -57,6 +60,28 @@ NVIDIA_API_KEY  = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_API_BASE = "https://integrate.api.nvidia.com/v1"
 KIMI_MODEL      = "moonshotai/kimi-k2-instruct"
 MAX_TOKENS      = int(os.getenv("AGENT_MAX_RESPONSE_TOKENS", "2048"))
+
+# ---------------------------------------------------------------------------
+# Shared rate-limiting primitives
+# ---------------------------------------------------------------------------
+# Import the module-level semaphore from agent.core so that ALL NVIDIA calls
+# (main agent + video dialogue agent) share the same global concurrency cap.
+# This is a lazy import inside the class to avoid circular imports at module
+# load time; the reference is cached on first use.
+_shared_semaphore = None
+
+def _get_semaphore():
+    """Return the shared LLM semaphore from agent.core (lazy import)."""
+    global _shared_semaphore
+    if _shared_semaphore is None:
+        from agent.core import _llm_semaphore  # noqa: PLC0415
+        _shared_semaphore = _llm_semaphore
+    return _shared_semaphore
+
+# Retry configuration — mirrors agent.core defaults
+_MAX_RETRIES     = int(os.getenv("AGENT_MAX_RETRIES", "3"))
+_BASE_DELAY_S    = float(os.getenv("AGENT_RETRY_BASE_DELAY_S", "5.0"))
+_MAX_DELAY_S     = float(os.getenv("AGENT_RETRY_MAX_DELAY_S", "60.0"))
 
 # ---------------------------------------------------------------------------
 # System prompt for the video dialogue specialist
@@ -260,9 +285,35 @@ class VideoDialogueAgent:
     # Internal LLM call
     # ------------------------------------------------------------------
 
+    async def _call_llm_with_retry(self, **kwargs) -> object:
+        """
+        Call self._client.chat.completions.create(**kwargs) with automatic
+        exponential-backoff retry on HTTP 429 (RateLimitError).
+        Non-429 APIErrors are re-raised immediately.
+        """
+        last_exc = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                return await self._client.chat.completions.create(**kwargs)
+            except RateLimitError as exc:
+                last_exc = exc
+                if attempt >= _MAX_RETRIES:
+                    raise
+                delay = min(_BASE_DELAY_S * (2 ** attempt), _MAX_DELAY_S)
+                logger.warning(
+                    "VideoDialogueAgent: NVIDIA 429 (attempt %d/%d). Retrying in %.1fs.",
+                    attempt + 1, _MAX_RETRIES, delay,
+                )
+                await asyncio.sleep(delay)
+            except APIError:
+                raise
+        raise last_exc  # type: ignore[misc]
+
     async def _call_llm(self, session: VideoSession) -> "DialogueResult":
         """
         Call Kimi K2 with the full dialogue history.
+        Acquires the shared global semaphore before calling NVIDIA so that
+        video dialogue calls are serialised alongside main agent calls.
         Handles the submit_video_prompts tool call if triggered.
         """
         if not NVIDIA_API_KEY:
@@ -281,13 +332,26 @@ class VideoDialogueAgent:
         ]
 
         try:
-            response = await self._client.chat.completions.create(
-                model=KIMI_MODEL,
-                messages=messages,
-                tools=[SUBMIT_PROMPTS_TOOL],
-                tool_choice="auto",
-                max_tokens=MAX_TOKENS,
-                temperature=0.7,
+            # Acquire the shared semaphore — this serialises video dialogue
+            # calls alongside main @bot calls under the same global cap.
+            async with _get_semaphore():
+                response = await self._call_llm_with_retry(
+                    model=KIMI_MODEL,
+                    messages=messages,
+                    tools=[SUBMIT_PROMPTS_TOOL],
+                    tool_choice="auto",
+                    max_tokens=MAX_TOKENS,
+                    temperature=0.7,
+                )
+        except RateLimitError as exc:
+            logger.error("VideoDialogueAgent: NVIDIA 429 exhausted after retries: %s", exc)
+            return DialogueResult(
+                reply=(
+                    "⏳ The AI service is currently busy. "
+                    "Please try again in a minute or two."
+                ),
+                prompts=None,
+                error=str(exc),
             )
         except APIError as exc:
             logger.error("Kimi K2 API error in VideoDialogueAgent: %s", exc)

@@ -25,6 +25,18 @@ Memory Architecture:
     org-wide operational memories, injected as a briefing section at the
     top of the user message. Populated nightly by the DreamEngine.
 
+Rate Limiting (three-layer defence):
+  1. Global concurrency semaphore (AGENT_MAX_CONCURRENT_CALLS, default 1):
+     At most N Kimi K2 calls in flight simultaneously. All other callers
+     queue behind the semaphore rather than racing NVIDIA and getting 429s.
+  2. Per-user cooldown (enforced in bot.py, not here):
+     Users are rejected within AGENT_USER_COOLDOWN_S seconds of their last
+     successful query. See bot/_handle_agent_query.
+  3. 429 retry-with-backoff (_call_llm_with_retry):
+     On RateLimitError the call is retried up to AGENT_MAX_RETRIES times
+     with exponential backoff (2^attempt * base_delay, capped at max_delay).
+     Other APIErrors are not retried (they are surfaced immediately).
+
 Provider: NVIDIA NIM
   Endpoint: https://integrate.api.nvidia.com/v1
   Model:    moonshotai/kimi-k2-instruct
@@ -42,7 +54,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from openai import AsyncOpenAI, APIError
+from openai import AsyncOpenAI, APIError, RateLimitError
 
 from agent.tools import (
     query_liberation_archives,
@@ -77,6 +89,36 @@ MAX_TOOL_ITERATIONS = 3
 # Minimum message length to keep during compaction (messages shorter than this
 # are candidates for removal if the history is too long)
 COMPACT_MIN_MESSAGE_LENGTH = int(os.getenv("AGENT_COMPACT_MIN_MSG_LEN", "20"))
+
+# ---------------------------------------------------------------------------
+# Rate limiting configuration
+# ---------------------------------------------------------------------------
+
+# Layer 1 — Global concurrency semaphore.
+# Maximum number of simultaneous Kimi K2 API calls across ALL users.
+# Setting this to 1 serialises all LLM calls so at most one is in-flight at
+# a time, preventing multiple concurrent users from exhausting NVIDIA's
+# per-key rate limit. Raise to 2-3 if NVIDIA grants a higher rate tier.
+AGENT_MAX_CONCURRENT_CALLS = int(os.getenv("AGENT_MAX_CONCURRENT_CALLS", "1"))
+
+# Layer 3 — 429 retry-with-backoff.
+# Maximum number of retry attempts on RateLimitError (HTTP 429).
+AGENT_MAX_RETRIES = int(os.getenv("AGENT_MAX_RETRIES", "3"))
+
+# Base delay (seconds) for the first retry. Subsequent retries use
+# exponential backoff: base * 2^attempt (capped at AGENT_RETRY_MAX_DELAY_S).
+AGENT_RETRY_BASE_DELAY_S = float(os.getenv("AGENT_RETRY_BASE_DELAY_S", "5.0"))
+
+# Maximum delay (seconds) between retries regardless of backoff calculation.
+AGENT_RETRY_MAX_DELAY_S = float(os.getenv("AGENT_RETRY_MAX_DELAY_S", "60.0"))
+
+# ---------------------------------------------------------------------------
+# Module-level semaphore (shared across all AgentCore instances)
+# ---------------------------------------------------------------------------
+# This is intentionally module-level so that even if multiple AgentCore
+# instances are created (e.g. in tests), they all share the same semaphore
+# and the global concurrency limit is always respected.
+_llm_semaphore = asyncio.Semaphore(AGENT_MAX_CONCURRENT_CALLS)
 
 # ---------------------------------------------------------------------------
 # System Prompt
@@ -124,6 +166,11 @@ class AgentCore:
 
     This class manages the LLM client, tool execution, and response generation.
     It is designed to be called from the Matrix bot's message handler.
+
+    Rate limiting is applied at three layers:
+      1. Module-level asyncio.Semaphore (_llm_semaphore) — global concurrency cap.
+      2. Per-user cooldown — enforced by the caller (bot.py) before calling here.
+      3. 429 retry-with-backoff — handled inside _call_llm_with_retry().
     """
 
     def __init__(self):
@@ -138,11 +185,83 @@ class AgentCore:
         )
         self._tools = [LIBERATION_ARCHIVES_TOOL_SCHEMA]
         logger.info(
-            "AgentCore initialized. Model: %s | NotebookLM: %s | Context window: %d messages",
+            "AgentCore initialized. Model: %s | NotebookLM: %s | "
+            "Context window: %d messages | Max concurrent calls: %d | "
+            "Max retries on 429: %d",
             KIMI_MODEL,
             "enabled" if NOTEBOOKLM_ENABLED else "disabled",
             CONTEXT_WINDOW_MESSAGES,
+            AGENT_MAX_CONCURRENT_CALLS,
+            AGENT_MAX_RETRIES,
         )
+
+    # ------------------------------------------------------------------
+    # Rate limiting helpers
+    # ------------------------------------------------------------------
+
+    async def _call_llm_with_retry(self, **kwargs) -> object:
+        """
+        Call self.client.chat.completions.create(**kwargs) with automatic
+        exponential-backoff retry on HTTP 429 (RateLimitError).
+
+        Retries up to AGENT_MAX_RETRIES times. Non-429 APIErrors are
+        re-raised immediately without retrying (they indicate a real problem,
+        not transient throttling).
+
+        This method does NOT hold the semaphore — the caller is responsible
+        for acquiring it before calling this method.
+
+        Args:
+            **kwargs: Passed directly to chat.completions.create().
+
+        Returns:
+            The ChatCompletion response object.
+
+        Raises:
+            RateLimitError: If all retries are exhausted.
+            APIError:       On any non-429 API error.
+        """
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(AGENT_MAX_RETRIES + 1):
+            try:
+                return await self.client.chat.completions.create(**kwargs)
+
+            except RateLimitError as exc:
+                last_exc = exc
+                if attempt >= AGENT_MAX_RETRIES:
+                    logger.error(
+                        "NVIDIA 429 RateLimitError: all %d retries exhausted.",
+                        AGENT_MAX_RETRIES,
+                    )
+                    raise
+
+                # Exponential backoff: base * 2^attempt, capped at max
+                delay = min(
+                    AGENT_RETRY_BASE_DELAY_S * (2 ** attempt),
+                    AGENT_RETRY_MAX_DELAY_S,
+                )
+                logger.warning(
+                    "NVIDIA 429 RateLimitError (attempt %d/%d). "
+                    "Retrying in %.1fs. Error: %s",
+                    attempt + 1,
+                    AGENT_MAX_RETRIES,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+
+            except APIError:
+                # Non-429 API errors (auth failure, bad request, etc.)
+                # are not transient — re-raise immediately.
+                raise
+
+        # Should never reach here, but satisfy the type checker
+        raise last_exc  # type: ignore[misc]
+
+    # ------------------------------------------------------------------
+    # Context helpers
+    # ------------------------------------------------------------------
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt with the current date injected."""
@@ -265,6 +384,10 @@ class AgentCore:
             lines.append(f"  [{topic} — updated {updated_dt}]: {text}")
         return "\n".join(lines)
 
+    # ------------------------------------------------------------------
+    # Tool execution
+    # ------------------------------------------------------------------
+
     async def _execute_tool_call(self, tool_name: str, tool_args: dict) -> str:
         """
         Execute a tool call requested by the agent.
@@ -286,6 +409,10 @@ class AgentCore:
                 f"Only 'query_liberation_archives' is permitted."
             )
 
+    # ------------------------------------------------------------------
+    # Main generation method
+    # ------------------------------------------------------------------
+
     async def generate_response(
         self,
         user_query: str,
@@ -301,9 +428,10 @@ class AgentCore:
         This method implements the full agent loop:
         1. Build context from long-term memories (user + operational).
         2. Build context from recent chat history (last 30 messages, compacted).
-        3. Call Kimi K2 with the user query and tools.
-        4. If the model requests a tool call, execute it and continue.
-        5. Return the final text response and metadata.
+        3. Acquire the global LLM semaphore (queues if another call is in flight).
+        4. Call Kimi K2 with the user query and tools (with 429 retry-backoff).
+        5. If the model requests a tool call, execute it and continue.
+        6. Release the semaphore and return the final text response + metadata.
 
         Args:
             user_query:           The user's message text.
@@ -321,6 +449,7 @@ class AgentCore:
               - tool_calls_made (list[str]): Names of tools called.
               - latency_ms (int): Total generation time in milliseconds.
               - error (str|None): Error message if generation failed.
+              - rate_limited (bool): True if a 429 was encountered (even if retried OK).
         """
         if not NVIDIA_API_KEY:
             return {
@@ -334,12 +463,14 @@ class AgentCore:
                 "tool_calls_made": [],
                 "latency_ms": 0,
                 "error": "NVIDIA_API_KEY not set",
+                "rate_limited": False,
             }
 
         start_time = time.monotonic()
         tool_calls_made = []
         notebooklm_query = None
         notebooklm_response = None
+        rate_limited_encountered = False
 
         # --- Build context sections ---
         chat_history_text = self._format_chat_history(recent_messages or [])
@@ -381,119 +512,161 @@ class AgentCore:
             {"role": "user", "content": full_user_message},
         ]
 
-        try:
-            # Agent loop: allow up to MAX_TOOL_ITERATIONS rounds of tool use
-            for iteration in range(MAX_TOOL_ITERATIONS + 1):
-                response = await self.client.chat.completions.create(
-                    model=KIMI_MODEL,
-                    messages=messages,
-                    tools=self._tools,
-                    tool_choice="auto",
-                    max_tokens=MAX_RESPONSE_TOKENS,
-                    temperature=0.7,
+        # --- Acquire global concurrency semaphore ---
+        # All callers queue here. At most AGENT_MAX_CONCURRENT_CALLS LLM
+        # requests are in-flight at any given time, preventing simultaneous
+        # users from racing NVIDIA and collectively triggering 429s.
+        queue_wait_start = time.monotonic()
+        async with _llm_semaphore:
+            queue_wait_ms = int((time.monotonic() - queue_wait_start) * 1000)
+            if queue_wait_ms > 500:
+                logger.info(
+                    "Agent query for %s waited %.1fs in semaphore queue.",
+                    sender_id,
+                    queue_wait_ms / 1000,
                 )
 
-                choice = response.choices[0]
-                assistant_message = choice.message
-
-                # If the model returned a final text response, we're done
-                if choice.finish_reason == "stop" or not assistant_message.tool_calls:
-                    final_text = assistant_message.content or ""
-                    latency_ms = int((time.monotonic() - start_time) * 1000)
-                    logger.info(
-                        "Agent response generated in %dms. Tools called: %s",
-                        latency_ms,
-                        tool_calls_made,
-                    )
-                    return {
-                        "response": final_text,
-                        "notebooklm_query": notebooklm_query,
-                        "notebooklm_response": notebooklm_response,
-                        "tool_calls_made": tool_calls_made,
-                        "latency_ms": latency_ms,
-                        "error": None,
-                    }
-
-                # The model wants to call tools — execute them
-                messages.append(assistant_message)
-
-                for tool_call in assistant_message.tool_calls:
-                    tool_name = tool_call.function.name
+            try:
+                # Agent loop: allow up to MAX_TOOL_ITERATIONS rounds of tool use
+                for iteration in range(MAX_TOOL_ITERATIONS + 1):
                     try:
-                        tool_args = json.loads(tool_call.function.arguments)
-                    except json.JSONDecodeError:
-                        tool_args = {}
+                        response = await self._call_llm_with_retry(
+                            model=KIMI_MODEL,
+                            messages=messages,
+                            tools=self._tools,
+                            tool_choice="auto",
+                            max_tokens=MAX_RESPONSE_TOKENS,
+                            temperature=0.7,
+                        )
+                    except RateLimitError as exc:
+                        # All retries exhausted — surface a friendly message
+                        rate_limited_encountered = True
+                        latency_ms = int((time.monotonic() - start_time) * 1000)
+                        logger.error(
+                            "Agent 429 exhausted for %s after %dms: %s",
+                            sender_id, latency_ms, exc,
+                        )
+                        return {
+                            "response": (
+                                "⏳ The AI service is currently busy and could not "
+                                "process your request after several retries. "
+                                "Please try again in a minute or two."
+                            ),
+                            "notebooklm_query": notebooklm_query,
+                            "notebooklm_response": notebooklm_response,
+                            "tool_calls_made": tool_calls_made,
+                            "latency_ms": latency_ms,
+                            "error": f"RateLimitError: {exc}",
+                            "rate_limited": True,
+                        }
 
-                    tool_calls_made.append(tool_name)
-                    logger.info(
-                        "Agent calling tool: %s | args: %s",
-                        tool_name,
-                        str(tool_args)[:200],
-                    )
+                    choice = response.choices[0]
+                    assistant_message = choice.message
 
-                    # Track NotebookLM-specific metadata
-                    if tool_name == "query_liberation_archives":
-                        notebooklm_query = tool_args.get("query", "")
+                    # If the model returned a final text response, we're done
+                    if choice.finish_reason == "stop" or not assistant_message.tool_calls:
+                        final_text = assistant_message.content or ""
+                        latency_ms = int((time.monotonic() - start_time) * 1000)
+                        logger.info(
+                            "Agent response generated in %dms (queue wait: %dms). "
+                            "Tools called: %s",
+                            latency_ms,
+                            queue_wait_ms,
+                            tool_calls_made,
+                        )
+                        return {
+                            "response": final_text,
+                            "notebooklm_query": notebooklm_query,
+                            "notebooklm_response": notebooklm_response,
+                            "tool_calls_made": tool_calls_made,
+                            "latency_ms": latency_ms,
+                            "error": None,
+                            "rate_limited": rate_limited_encountered,
+                        }
 
-                    tool_result = await self._execute_tool_call(tool_name, tool_args)
+                    # The model wants to call tools — execute them
+                    messages.append(assistant_message)
 
-                    if tool_name == "query_liberation_archives":
-                        notebooklm_response = tool_result
+                    for tool_call in assistant_message.tool_calls:
+                        tool_name = tool_call.function.name
+                        try:
+                            tool_args = json.loads(tool_call.function.arguments)
+                        except json.JSONDecodeError:
+                            tool_args = {}
 
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": tool_result,
-                    })
+                        tool_calls_made.append(tool_name)
+                        logger.info(
+                            "Agent calling tool: %s | args: %s",
+                            tool_name,
+                            str(tool_args)[:200],
+                        )
 
-                if iteration >= MAX_TOOL_ITERATIONS:
-                    # Safety: force a final response after max iterations
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "Please provide your final response based on the "
-                            "information gathered so far."
-                        ),
-                    })
+                        # Track NotebookLM-specific metadata
+                        if tool_name == "query_liberation_archives":
+                            notebooklm_query = tool_args.get("query", "")
 
-            # Fallback if loop exits without returning
-            latency_ms = int((time.monotonic() - start_time) * 1000)
-            return {
-                "response": (
-                    "I was unable to generate a complete response. "
-                    "Please try again or rephrase your question."
-                ),
-                "notebooklm_query": notebooklm_query,
-                "notebooklm_response": notebooklm_response,
-                "tool_calls_made": tool_calls_made,
-                "latency_ms": latency_ms,
-                "error": "Max tool iterations reached without final response",
-            }
+                        tool_result = await self._execute_tool_call(tool_name, tool_args)
 
-        except APIError as exc:
-            latency_ms = int((time.monotonic() - start_time) * 1000)
-            logger.error("Kimi K2 API error: %s", exc, exc_info=True)
-            return {
-                "response": (
-                    "⚠️ I encountered an error connecting to the AI service. "
-                    "Please try again in a moment."
-                ),
-                "notebooklm_query": notebooklm_query,
-                "notebooklm_response": notebooklm_response,
-                "tool_calls_made": tool_calls_made,
-                "latency_ms": latency_ms,
-                "error": str(exc),
-            }
-        except Exception as exc:
-            latency_ms = int((time.monotonic() - start_time) * 1000)
-            logger.error("Unexpected agent error: %s", exc, exc_info=True)
-            return {
-                "response": (
-                    "⚠️ An unexpected error occurred. Please try again."
-                ),
-                "notebooklm_query": notebooklm_query,
-                "notebooklm_response": notebooklm_response,
-                "tool_calls_made": tool_calls_made,
-                "latency_ms": latency_ms,
-                "error": str(exc),
-            }
+                        if tool_name == "query_liberation_archives":
+                            notebooklm_response = tool_result
+
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": tool_result,
+                        })
+
+                    if iteration >= MAX_TOOL_ITERATIONS:
+                        # Safety: force a final response after max iterations
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "Please provide your final response based on the "
+                                "information gathered so far."
+                            ),
+                        })
+
+                # Fallback if loop exits without returning
+                latency_ms = int((time.monotonic() - start_time) * 1000)
+                return {
+                    "response": (
+                        "I was unable to generate a complete response. "
+                        "Please try again or rephrase your question."
+                    ),
+                    "notebooklm_query": notebooklm_query,
+                    "notebooklm_response": notebooklm_response,
+                    "tool_calls_made": tool_calls_made,
+                    "latency_ms": latency_ms,
+                    "error": "Max tool iterations reached without final response",
+                    "rate_limited": rate_limited_encountered,
+                }
+
+            except APIError as exc:
+                latency_ms = int((time.monotonic() - start_time) * 1000)
+                logger.error("Kimi K2 API error: %s", exc, exc_info=True)
+                return {
+                    "response": (
+                        "⚠️ I encountered an error connecting to the AI service. "
+                        "Please try again in a moment."
+                    ),
+                    "notebooklm_query": notebooklm_query,
+                    "notebooklm_response": notebooklm_response,
+                    "tool_calls_made": tool_calls_made,
+                    "latency_ms": latency_ms,
+                    "error": str(exc),
+                    "rate_limited": rate_limited_encountered,
+                }
+            except Exception as exc:
+                latency_ms = int((time.monotonic() - start_time) * 1000)
+                logger.error("Unexpected agent error: %s", exc, exc_info=True)
+                return {
+                    "response": (
+                        "⚠️ An unexpected error occurred. Please try again."
+                    ),
+                    "notebooklm_query": notebooklm_query,
+                    "notebooklm_response": notebooklm_response,
+                    "tool_calls_made": tool_calls_made,
+                    "latency_ms": latency_ms,
+                    "error": str(exc),
+                    "rate_limited": rate_limited_encountered,
+                }
