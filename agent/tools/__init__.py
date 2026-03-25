@@ -13,6 +13,10 @@ from .memory_tools import (
     VALID_USER_CATEGORIES,
     VALID_OPERATIONAL_TOPICS,
 )
+from .dms_tools import (
+    get_dms_status,
+    GET_DMS_STATUS_TOOL_SCHEMA,
+)
 
 __all__ = [
     # Liberation Archives
@@ -27,4 +31,7 @@ __all__ = [
     "UPSERT_MEMORY_TOOL_SCHEMA",
     "VALID_USER_CATEGORIES",
     "VALID_OPERATIONAL_TOPICS",
+    # DMS tools
+    "get_dms_status",
+    "GET_DMS_STATUS_TOOL_SCHEMA",
 ]

@@ -37,6 +37,19 @@ from pydantic import BaseModel, field_validator
 from db import DMSDB
 from matrix_otp import generate_otp, send_otp_dm
 
+# Import the canonical Database class so we can delegate bot-owned writes
+import sys
+import os as _os
+_bot_root = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", ".."))
+if _bot_root not in sys.path:
+    sys.path.insert(0, _bot_root)
+try:
+    from db.database import Database as BotDatabase
+    _BOT_DB_AVAILABLE = True
+except ImportError:
+    _BOT_DB_AVAILABLE = False
+    BotDatabase = None
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -76,6 +89,25 @@ bearer = HTTPBearer()
 @app.on_event("startup")
 async def startup():
     await db.connect()
+    # Inject the canonical bot Database instance so that write operations on
+    # bot-owned tables (registered_users, user_profiles, audit_log) are
+    # delegated to a single authoritative implementation instead of
+    # duplicating the SQL in two places.
+    if _BOT_DB_AVAILABLE:
+        try:
+            bot_db = BotDatabase(DATABASE_PATH)
+            await bot_db.connect()
+            db.set_bot_db(bot_db)
+            logger.info("Bot DB instance injected into DMSDB for write delegation.")
+        except Exception as exc:
+            logger.warning(
+                "Could not inject bot DB instance — falling back to direct SQL: %s", exc
+            )
+    else:
+        logger.warning(
+            "db.database module not importable from DMS UI backend path — "
+            "write delegation disabled, using direct SQL fallback."
+        )
     logger.info("DMS UI backend started.")
 
 

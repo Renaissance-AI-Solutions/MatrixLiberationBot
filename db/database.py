@@ -1099,3 +1099,106 @@ class Database:
             (name,),
         )
         await self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # [DMS] Agent-safe status summary
+    # ------------------------------------------------------------------
+    async def get_dms_status(self, matrix_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Return a safe, non-sensitive summary of a member's Dead Man's Switch
+        status for use by the agent tool.
+
+        Security contract — this method NEVER returns:
+          - vault_text (the user's plaintext final message)
+          - legal_name, date_of_birth, physical_address
+          - emergency_contacts details (only a count is returned)
+          - OTP data of any kind
+
+        Returns a dict with:
+          registered            bool  — False if user is not registered at all
+          status                str   — ACTIVE | MISSING | ESCALATED | RELEASED | UNREGISTERED
+          last_active_str       str   — Human-readable UTC datetime of last activity
+          elapsed_h             float — Hours since last recorded activity
+          threshold_h           int   — Hours before missing alert triggers
+          time_remaining_h      float — Hours remaining before alert (0.0 if overdue)
+          vault_configured      bool  — True if an emergency vault entry exists
+          emergency_contacts_count int — Number of emergency contacts configured
+          has_release_actions   bool  — True if release actions are configured in the portal
+
+        Returns None only if a database error occurs (caller should surface
+        a generic error message to the user).
+        """
+        import json as _json
+        now_ts = datetime.now(timezone.utc).timestamp()
+
+        try:
+            user = await self.get_user(matrix_id)
+            if not user:
+                return {
+                    "matrix_id": matrix_id,
+                    "registered": False,
+                    "status": "UNREGISTERED",
+                    "last_active_str": None,
+                    "elapsed_h": None,
+                    "threshold_h": None,
+                    "time_remaining_h": None,
+                    "vault_configured": False,
+                    "emergency_contacts_count": 0,
+                    "has_release_actions": False,
+                }
+
+            last_active_ts = user["last_active_ts"] or now_ts
+            threshold_h = user["missing_threshold_h"] or 72
+            elapsed_h = (now_ts - last_active_ts) / 3600
+            time_remaining_h = max(0.0, threshold_h - elapsed_h)
+            last_active_str = datetime.fromtimestamp(
+                last_active_ts, tz=timezone.utc
+            ).strftime("%Y-%m-%d %H:%M UTC")
+
+            # Vault existence check — metadata only, no content
+            vault_row = await self.get_emergency_data(matrix_id)
+            vault_configured = vault_row is not None
+
+            # UI profile: count contacts and release actions only
+            emergency_contacts_count = 0
+            has_release_actions = False
+            try:
+                async with self._conn.execute(
+                    "SELECT emergency_contacts, release_actions "
+                    "FROM dms_ui_profiles WHERE matrix_id = ?",
+                    (matrix_id,),
+                ) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        try:
+                            contacts = _json.loads(row["emergency_contacts"] or "[]")
+                            emergency_contacts_count = (
+                                len(contacts) if isinstance(contacts, list) else 0
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            actions = _json.loads(row["release_actions"] or "[]")
+                            has_release_actions = bool(actions)
+                        except Exception:
+                            pass
+            except Exception:
+                # dms_ui_profiles may not exist yet if the portal has never been used
+                pass
+
+            return {
+                "matrix_id": matrix_id,
+                "registered": True,
+                "status": user["status"],
+                "last_active_str": last_active_str,
+                "elapsed_h": round(elapsed_h, 2),
+                "threshold_h": threshold_h,
+                "time_remaining_h": round(time_remaining_h, 2),
+                "vault_configured": vault_configured,
+                "emergency_contacts_count": emergency_contacts_count,
+                "has_release_actions": has_release_actions,
+            }
+
+        except Exception as exc:
+            logger.error("get_dms_status failed for %s: %s", matrix_id, exc)
+            return None

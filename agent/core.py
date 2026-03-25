@@ -70,6 +70,8 @@ from agent.tools import (
     upsert_memory,
     SEARCH_MEMORIES_TOOL_SCHEMA,
     UPSERT_MEMORY_TOOL_SCHEMA,
+    get_dms_status,
+    GET_DMS_STATUS_TOOL_SCHEMA,
 )
 
 logger = logging.getLogger(__name__)
@@ -154,6 +156,12 @@ Do NOT dump all memories into your response — use what is relevant.
 - The group discusses something that should be remembered organizationally (new threat actor, legal strategy decision, operational planning update).
 Do NOT call this for conversational filler. Only save genuinely important new information that should persist across sessions.
 
+**`get_dms_status`** — Retrieve this member's Dead Man's Switch status. Call this when a member asks about:
+- Their heartbeat timer or how long until their switch triggers
+- When they last checked in or their current DMS status
+- Whether their vault message, emergency contacts, or release actions are configured
+This tool is **read-only** — it cannot modify any DMS settings. To update settings, direct the member to the portal.
+
 You also have access to:
 - **Recent room chat history** — the last 30 messages from this Matrix room (provided in every query)
 
@@ -214,10 +222,14 @@ class AgentCore:
         # Store the DB reference for tool closure injection
         self.db = db
 
-        # Register tools — memory tools only available when db is provided
+        # Register tools — memory and DMS tools only available when db is provided
         self._tools = [LIBERATION_ARCHIVES_TOOL_SCHEMA]
         if self.db is not None:
-            self._tools += [SEARCH_MEMORIES_TOOL_SCHEMA, UPSERT_MEMORY_TOOL_SCHEMA]
+            self._tools += [
+                SEARCH_MEMORIES_TOOL_SCHEMA,
+                UPSERT_MEMORY_TOOL_SCHEMA,
+                GET_DMS_STATUS_TOOL_SCHEMA,
+            ]
 
         logger.info(
             "AgentCore initialized. Model: %s | NotebookLM: %s | "
@@ -435,6 +447,13 @@ class AgentCore:
                 confidence=tool_args.get("confidence", 0.8),
             )
 
+        elif tool_name == "get_dms_status":
+            # sender_id injected — agent cannot query another user's DMS status
+            return await get_dms_status(
+                db=self.db,
+                sender_id=sender_id,
+            )
+
         else:
             # This should never happen given the strict tool schema, but
             # we log it as a security event if it does.
@@ -444,7 +463,8 @@ class AgentCore:
             )
             return (
                 f"[Security Restriction] Tool '{tool_name}' is not available. "
-                f"Permitted tools: query_liberation_archives, search_memories, upsert_memory."
+                f"Permitted tools: query_liberation_archives, search_memories, "
+                f"upsert_memory, get_dms_status."
             )
 
     # ------------------------------------------------------------------
