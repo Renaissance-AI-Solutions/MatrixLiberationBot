@@ -10,11 +10,16 @@ It reuses the existing bot tables:
   - emergency_vault    (matrix_id, encrypted_data, iv, created_ts, released_ts)
   - audit_log          (id, event_ts, event_type, actor_matrix_id, target_matrix_id, note)
 
-And adds two UI-specific tables:
+And adds UI-specific tables:
   - dms_otp_challenges (matrix_id, otp_hash, expires_ts, used)
   - dms_ui_profiles    (matrix_id, emergency_contacts JSON, social_media JSON,
                         legal_name, date_of_birth, physical_address,
                         vault_text, release_actions JSON, updated_ts)
+
+It also reads from the Dream memory tables created by the bot:
+  - user_memories      (per-user long-term memories, versioned)
+  - operational_memories (org-wide operational memories, versioned)
+  - dream_cycles       (audit log of Dream Engine runs)
 
 The vault_text in dms_ui_profiles stores the user's PLAINTEXT final message.
 It is stored server-side (same security model as the bot's encrypted vault —
@@ -238,3 +243,173 @@ class DMSDB:
             ),
         )
         await self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Dream Memory — User Memories
+    # ------------------------------------------------------------------
+
+    async def get_user_memories(
+        self,
+        matrix_id: str,
+        include_deleted: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return all active long-term memories for a specific user.
+        By default, soft-deleted memories are excluded.
+        """
+        if include_deleted:
+            query = """
+                SELECT * FROM user_memories
+                WHERE matrix_id = ?
+                ORDER BY category, updated_ts DESC
+            """
+            params = (matrix_id,)
+        else:
+            query = """
+                SELECT * FROM user_memories
+                WHERE matrix_id = ? AND is_deleted = 0
+                ORDER BY category, updated_ts DESC
+            """
+            params = (matrix_id,)
+
+        async with self._conn.execute(query, params) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_user_memory_by_id(
+        self, memory_id: int, matrix_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a single user memory by ID, scoped to the owning user."""
+        async with self._conn.execute(
+            "SELECT * FROM user_memories WHERE id = ? AND matrix_id = ?",
+            (memory_id, matrix_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def get_user_memory_history(
+        self, memory_id: int, matrix_id: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Return the full version history for a user memory.
+        Ordered from oldest to newest version.
+        """
+        async with self._conn.execute(
+            """SELECT * FROM user_memory_history
+               WHERE memory_id = ? AND matrix_id = ?
+               ORDER BY version ASC""",
+            (memory_id, matrix_id),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def update_user_memory(
+        self,
+        memory_id: int,
+        matrix_id: str,
+        new_text: str,
+        edited_by: str = "user",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Update the text of a user memory (user-initiated edit).
+
+        This:
+          1. Saves the current version to user_memory_history.
+          2. Increments the version number.
+          3. Updates the memory text and records the editor.
+
+        Returns the updated memory dict, or None if not found.
+        """
+        existing = await self.get_user_memory_by_id(memory_id, matrix_id)
+        if not existing:
+            return None
+
+        now = datetime.now(timezone.utc).timestamp()
+
+        # Archive the current version
+        await self._conn.execute(
+            """INSERT INTO user_memory_history
+                   (memory_id, matrix_id, version, memory_text, archived_ts, archived_by)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                memory_id,
+                matrix_id,
+                existing["version"],
+                existing["memory_text"],
+                now,
+                edited_by,
+            ),
+        )
+
+        # Update the live memory
+        new_version = existing["version"] + 1
+        await self._conn.execute(
+            """UPDATE user_memories
+               SET memory_text = ?,
+                   version     = ?,
+                   updated_ts  = ?,
+                   last_edited_by = ?
+               WHERE id = ? AND matrix_id = ?""",
+            (new_text, new_version, now, edited_by, memory_id, matrix_id),
+        )
+        await self._conn.commit()
+
+        return await self.get_user_memory_by_id(memory_id, matrix_id)
+
+    async def soft_delete_user_memory(
+        self, memory_id: int, matrix_id: str
+    ) -> bool:
+        """
+        Soft-delete a user memory. The record is retained in the database
+        with is_deleted=1 so version history is preserved.
+        Returns True if a row was updated, False if not found.
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        async with self._conn.execute(
+            """UPDATE user_memories
+               SET is_deleted = 1, updated_ts = ?
+               WHERE id = ? AND matrix_id = ? AND is_deleted = 0""",
+            (now, memory_id, matrix_id),
+        ) as cur:
+            changed = cur.rowcount
+        await self._conn.commit()
+        return changed > 0
+
+    async def restore_user_memory(
+        self, memory_id: int, matrix_id: str
+    ) -> bool:
+        """Restore a previously soft-deleted user memory."""
+        now = datetime.now(timezone.utc).timestamp()
+        async with self._conn.execute(
+            """UPDATE user_memories
+               SET is_deleted = 0, updated_ts = ?
+               WHERE id = ? AND matrix_id = ? AND is_deleted = 1""",
+            (now, memory_id, matrix_id),
+        ) as cur:
+            changed = cur.rowcount
+        await self._conn.commit()
+        return changed > 0
+
+    # ------------------------------------------------------------------
+    # Dream Memory — Dream Cycle Status
+    # ------------------------------------------------------------------
+
+    async def get_dream_cycles(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Return the most recent Dream Engine cycle records."""
+        async with self._conn.execute(
+            """SELECT * FROM dream_cycles
+               ORDER BY started_ts DESC LIMIT ?""",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_last_dream_cycle(self) -> Optional[Dict[str, Any]]:
+        """Return the most recent completed Dream cycle."""
+        async with self._conn.execute(
+            """SELECT * FROM dream_cycles
+               WHERE status = 'completed'
+               ORDER BY started_ts DESC LIMIT 1""",
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None

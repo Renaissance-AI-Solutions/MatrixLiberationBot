@@ -9,14 +9,18 @@ Tables:
   - emergency_vault      : AES-256-GCM encrypted emergency data
   - consensus_votes      : Group consensus vote tracking
   - audit_log            : Privacy-safe event log (no plaintext data)
-  - chat_history         : [NEW] Full Matrix chat history for agent memory
-  - agent_queries        : [NEW] Liberation Archives query/response log
-  - video_sessions       : [NEW] Video planning session archive
-  - video_style_library  : [NEW] Saved reusable visual style prompts
+  - chat_history         : Full Matrix chat history for agent memory
+  - agent_queries        : Liberation Archives query/response log
+  - video_sessions       : Video planning session archive
+  - video_style_library  : Saved reusable visual style prompts
+  - user_memories        : [DREAM] Per-user long-term consolidated memories
+  - operational_memories : [DREAM] Org-wide operational long-term memories
+  - dream_cycles         : [DREAM] Audit log of Dream consolidation runs
 
 Security note: The agent has READ access to chat_history only.
 It cannot access emergency_vault, and all agent interactions are
 logged to agent_queries for auditability.
+The Dream Engine never reads emergency_vault data.
 """
 
 import aiosqlite
@@ -149,6 +153,78 @@ CREATE TABLE IF NOT EXISTS video_style_library (
     created_by  TEXT NOT NULL,               -- Matrix user ID
     created_ts  REAL NOT NULL,
     use_count   INTEGER NOT NULL DEFAULT 0
+);
+
+-- ============================================================
+-- [DREAM] User-Specific Long-Term Memory
+-- Stores consolidated, LLM-synthesized memories about individual
+-- users. Populated by the Dream cycle. Versioned for full audit
+-- trail and user-editable via the DMS UI portal.
+--
+-- Versioning strategy: on every update, a NEW row is inserted
+-- with version = old_version + 1. Queries always use the highest
+-- non-deleted version per (matrix_id, category).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS user_memories (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    matrix_id           TEXT NOT NULL,
+    category            TEXT NOT NULL,
+        -- Valid categories: 'symptoms', 'legal_status', 'personal_history',
+        --                   'preferences', 'triggers', 'relationships', 'notes'
+    memory_text         TEXT NOT NULL,        -- Synthesized memory in plain English
+    confidence          REAL NOT NULL DEFAULT 1.0,  -- 0.0-1.0 confidence score
+    source_event_ids    TEXT,                 -- JSON array of chat_history event_ids
+    created_ts          REAL NOT NULL,
+    updated_ts          REAL NOT NULL,
+    version             INTEGER NOT NULL DEFAULT 1,
+    is_user_edited      INTEGER NOT NULL DEFAULT 0,  -- 1 if user manually edited via portal
+    is_deleted          INTEGER NOT NULL DEFAULT 0   -- Soft delete; row kept for history
+);
+CREATE INDEX IF NOT EXISTS idx_user_memories_lookup
+    ON user_memories(matrix_id, category, is_deleted, version DESC);
+
+-- ============================================================
+-- [DREAM] Operational Long-Term Memory
+-- Stores consolidated group-level memories: activism strategies,
+-- neurowarfare documentation, planning notes, and organizational
+-- intelligence. Populated by the Dream cycle.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS operational_memories (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id             TEXT,                 -- NULL = org-wide memory
+    topic               TEXT NOT NULL,
+        -- Valid topics: 'neurowarfare_programs', 'countermeasures',
+        --               'legal_strategy', 'operational_planning',
+        --               'threat_actors', 'resources', 'brainstorming'
+    memory_text         TEXT NOT NULL,
+    confidence          REAL NOT NULL DEFAULT 1.0,
+    source_event_ids    TEXT,
+    created_ts          REAL NOT NULL,
+    updated_ts          REAL NOT NULL,
+    version             INTEGER NOT NULL DEFAULT 1,
+    is_deleted          INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_operational_memories_topic
+    ON operational_memories(topic, is_deleted, version DESC);
+CREATE INDEX IF NOT EXISTS idx_operational_memories_room
+    ON operational_memories(room_id, is_deleted);
+
+-- ============================================================
+-- [DREAM] Dream Cycle Audit Log
+-- Records every Dream cycle run for monitoring and debugging.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS dream_cycles (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_ts                  REAL NOT NULL,
+    completed_ts            REAL,
+    messages_processed      INTEGER NOT NULL DEFAULT 0,
+    user_memories_created   INTEGER NOT NULL DEFAULT 0,
+    user_memories_updated   INTEGER NOT NULL DEFAULT 0,
+    op_memories_created     INTEGER NOT NULL DEFAULT 0,
+    op_memories_updated     INTEGER NOT NULL DEFAULT 0,
+    status                  TEXT NOT NULL DEFAULT 'RUNNING'
+                                CHECK(status IN ('RUNNING','SUCCESS','FAILED','SKIPPED')),
+    error_note              TEXT
 );
 """
 
@@ -413,11 +489,13 @@ class Database:
     async def get_recent_messages(
         self,
         room_id: str,
-        limit: int = 20,
+        limit: int = 30,
     ) -> List[Dict[str, Any]]:
         """
         Retrieve the most recent `limit` messages from a room, ordered oldest-first
         so they can be fed directly into an LLM context window.
+
+        Default raised to 30 to provide richer short-term context.
         """
         async with self._conn.execute(
             """
@@ -440,6 +518,30 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
             return row[0] if row else 0
+
+    async def get_messages_since(
+        self,
+        since_ts: float,
+        limit: int = 2000,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve all messages across all rooms since a given Unix timestamp.
+        Used by the Dream Engine to fetch unprocessed messages.
+        Returns rows in chronological order.
+        """
+        async with self._conn.execute(
+            """
+            SELECT event_id, room_id, sender_id, sender_display_name,
+                   timestamp_ts, content
+            FROM chat_history
+            WHERE timestamp_ts > ?
+            ORDER BY timestamp_ts ASC
+            LIMIT ?
+            """,
+            (since_ts, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # [AGENTIC] Agent Queries (Liberation Archives Knowledge Base)
@@ -510,6 +612,331 @@ class Database:
             SELECT query_ts, user_matrix_id, user_query, agent_response
             FROM agent_queries
             ORDER BY query_ts DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # [DREAM] User Long-Term Memories
+    # ------------------------------------------------------------------
+
+    async def get_user_memories(
+        self,
+        matrix_id: str,
+        include_deleted: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return the latest version of each memory category for a user.
+        By default excludes soft-deleted memories.
+        """
+        deleted_filter = "" if include_deleted else "AND is_deleted = 0"
+        async with self._conn.execute(
+            f"""
+            SELECT id, matrix_id, category, memory_text, confidence,
+                   source_event_ids, created_ts, updated_ts, version,
+                   is_user_edited, is_deleted
+            FROM user_memories
+            WHERE matrix_id = ? {deleted_filter}
+            GROUP BY category
+            HAVING version = MAX(version)
+            ORDER BY category ASC
+            """,
+            (matrix_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_user_memory_by_category(
+        self,
+        matrix_id: str,
+        category: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the latest non-deleted memory for a specific user+category."""
+        async with self._conn.execute(
+            """
+            SELECT id, matrix_id, category, memory_text, confidence,
+                   source_event_ids, created_ts, updated_ts, version,
+                   is_user_edited, is_deleted
+            FROM user_memories
+            WHERE matrix_id = ? AND category = ? AND is_deleted = 0
+            ORDER BY version DESC
+            LIMIT 1
+            """,
+            (matrix_id, category),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def get_user_memory_history(
+        self,
+        matrix_id: str,
+        category: str,
+    ) -> List[Dict[str, Any]]:
+        """Return all versions of a memory (for the version history UI)."""
+        async with self._conn.execute(
+            """
+            SELECT id, matrix_id, category, memory_text, confidence,
+                   source_event_ids, created_ts, updated_ts, version,
+                   is_user_edited, is_deleted
+            FROM user_memories
+            WHERE matrix_id = ? AND category = ?
+            ORDER BY version DESC
+            """,
+            (matrix_id, category),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def upsert_user_memory(
+        self,
+        matrix_id: str,
+        category: str,
+        memory_text: str,
+        confidence: float = 1.0,
+        source_event_ids: Optional[str] = None,
+        is_user_edited: bool = False,
+    ) -> int:
+        """
+        Insert a new version of a user memory. If a previous version exists,
+        the new row gets version = old_version + 1. Returns the new row ID.
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        # Find the current highest version for this user+category
+        async with self._conn.execute(
+            """
+            SELECT COALESCE(MAX(version), 0) as max_ver, MIN(created_ts) as orig_ts
+            FROM user_memories
+            WHERE matrix_id = ? AND category = ?
+            """,
+            (matrix_id, category),
+        ) as cur:
+            row = await cur.fetchone()
+        max_ver = row["max_ver"] if row else 0
+        orig_ts = row["orig_ts"] if (row and row["orig_ts"]) else now
+
+        new_version = max_ver + 1
+        async with self._conn.execute(
+            """
+            INSERT INTO user_memories
+                (matrix_id, category, memory_text, confidence, source_event_ids,
+                 created_ts, updated_ts, version, is_user_edited, is_deleted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                matrix_id, category, memory_text, confidence, source_event_ids,
+                orig_ts, now, new_version, 1 if is_user_edited else 0,
+            ),
+        ) as cur:
+            row_id = cur.lastrowid
+        await self._conn.commit()
+        logger.debug(
+            "User memory upserted: %s / %s (v%d)", matrix_id, category, new_version
+        )
+        return row_id
+
+    async def soft_delete_user_memory(self, memory_id: int) -> bool:
+        """Soft-delete a user memory by its row ID. Returns True if found."""
+        now = datetime.now(timezone.utc).timestamp()
+        async with self._conn.execute(
+            "UPDATE user_memories SET is_deleted = 1, updated_ts = ? WHERE id = ?",
+            (now, memory_id),
+        ) as cur:
+            changed = cur.rowcount
+        await self._conn.commit()
+        return changed > 0
+
+    # ------------------------------------------------------------------
+    # [DREAM] Operational Long-Term Memories
+    # ------------------------------------------------------------------
+
+    async def get_operational_memories(
+        self,
+        room_id: Optional[str] = None,
+        topic: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return the latest version of operational memories.
+        Optionally filter by room_id and/or topic.
+        """
+        conditions = ["is_deleted = 0"]
+        params: list = []
+        if room_id is not None:
+            conditions.append("(room_id = ? OR room_id IS NULL)")
+            params.append(room_id)
+        if topic is not None:
+            conditions.append("topic = ?")
+            params.append(topic)
+        where = "WHERE " + " AND ".join(conditions)
+        params.append(limit)
+        async with self._conn.execute(
+            f"""
+            SELECT id, room_id, topic, memory_text, confidence,
+                   source_event_ids, created_ts, updated_ts, version, is_deleted
+            FROM operational_memories
+            {where}
+            GROUP BY topic
+            HAVING version = MAX(version)
+            ORDER BY updated_ts DESC
+            LIMIT ?
+            """,
+            params,
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_operational_memory_by_topic(
+        self,
+        topic: str,
+        room_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the latest non-deleted operational memory for a specific topic."""
+        if room_id:
+            async with self._conn.execute(
+                """
+                SELECT * FROM operational_memories
+                WHERE topic = ? AND room_id = ? AND is_deleted = 0
+                ORDER BY version DESC LIMIT 1
+                """,
+                (topic, room_id),
+            ) as cur:
+                row = await cur.fetchone()
+        else:
+            async with self._conn.execute(
+                """
+                SELECT * FROM operational_memories
+                WHERE topic = ? AND is_deleted = 0
+                ORDER BY version DESC LIMIT 1
+                """,
+                (topic,),
+            ) as cur:
+                row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def upsert_operational_memory(
+        self,
+        topic: str,
+        memory_text: str,
+        room_id: Optional[str] = None,
+        confidence: float = 1.0,
+        source_event_ids: Optional[str] = None,
+    ) -> int:
+        """
+        Insert a new version of an operational memory. Returns the new row ID.
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        async with self._conn.execute(
+            """
+            SELECT COALESCE(MAX(version), 0) as max_ver, MIN(created_ts) as orig_ts
+            FROM operational_memories
+            WHERE topic = ? AND (room_id = ? OR (room_id IS NULL AND ? IS NULL))
+            """,
+            (topic, room_id, room_id),
+        ) as cur:
+            row = await cur.fetchone()
+        max_ver = row["max_ver"] if row else 0
+        orig_ts = row["orig_ts"] if (row and row["orig_ts"]) else now
+
+        new_version = max_ver + 1
+        async with self._conn.execute(
+            """
+            INSERT INTO operational_memories
+                (room_id, topic, memory_text, confidence, source_event_ids,
+                 created_ts, updated_ts, version, is_deleted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                room_id, topic, memory_text, confidence, source_event_ids,
+                orig_ts, now, new_version,
+            ),
+        ) as cur:
+            row_id = cur.lastrowid
+        await self._conn.commit()
+        logger.debug(
+            "Operational memory upserted: %s (v%d)", topic, new_version
+        )
+        return row_id
+
+    # ------------------------------------------------------------------
+    # [DREAM] Dream Cycle Management
+    # ------------------------------------------------------------------
+
+    async def get_last_successful_dream(self) -> Optional[Dict[str, Any]]:
+        """Return the most recent successfully completed Dream cycle."""
+        async with self._conn.execute(
+            """
+            SELECT * FROM dream_cycles
+            WHERE status = 'SUCCESS'
+            ORDER BY run_ts DESC
+            LIMIT 1
+            """,
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def get_running_dream_cycle(self) -> Optional[Dict[str, Any]]:
+        """Return a currently RUNNING Dream cycle, if any."""
+        async with self._conn.execute(
+            "SELECT * FROM dream_cycles WHERE status = 'RUNNING' ORDER BY run_ts DESC LIMIT 1",
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def create_dream_cycle(self) -> int:
+        """Insert a new RUNNING Dream cycle record. Returns the row ID."""
+        now = datetime.now(timezone.utc).timestamp()
+        async with self._conn.execute(
+            "INSERT INTO dream_cycles (run_ts, status) VALUES (?, 'RUNNING')",
+            (now,),
+        ) as cur:
+            row_id = cur.lastrowid
+        await self._conn.commit()
+        return row_id
+
+    async def complete_dream_cycle(
+        self,
+        cycle_id: int,
+        status: str,
+        messages_processed: int = 0,
+        user_memories_created: int = 0,
+        user_memories_updated: int = 0,
+        op_memories_created: int = 0,
+        op_memories_updated: int = 0,
+        error_note: str = None,
+    ):
+        """Finalize a Dream cycle record with results."""
+        now = datetime.now(timezone.utc).timestamp()
+        await self._conn.execute(
+            """
+            UPDATE dream_cycles SET
+                completed_ts            = ?,
+                status                  = ?,
+                messages_processed      = ?,
+                user_memories_created   = ?,
+                user_memories_updated   = ?,
+                op_memories_created     = ?,
+                op_memories_updated     = ?,
+                error_note              = ?
+            WHERE id = ?
+            """,
+            (
+                now, status, messages_processed,
+                user_memories_created, user_memories_updated,
+                op_memories_created, op_memories_updated,
+                error_note, cycle_id,
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_recent_dream_cycles(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Return recent Dream cycle records for the admin dashboard."""
+        async with self._conn.execute(
+            """
+            SELECT * FROM dream_cycles
+            ORDER BY run_ts DESC
             LIMIT ?
             """,
             (limit,),

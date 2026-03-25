@@ -70,6 +70,36 @@ export const profileApi = {
   getAudit: () => client.get('/audit'),
 }
 
+// ── Dream Memory ──────────────────────────────────────────────────────────────
+
+export const memoryApi = {
+  /** List all AI memories for the current user, optionally including deleted ones. */
+  list: (includeDeleted = false) =>
+    client.get<MemoryListResponse>(`/memories?include_deleted=${includeDeleted}`),
+
+  /** Get a single memory with its full version history. */
+  get: (id: number) =>
+    client.get<MemoryDetailResponse>(`/memories/${id}`),
+
+  /** Edit the text of a memory (user-initiated correction). */
+  edit: (id: number, memoryText: string) =>
+    client.put<{ status: string; memory: UserMemory }>(`/memories/${id}`, {
+      memory_text: memoryText,
+    }),
+
+  /** Soft-delete a memory (preserves version history). */
+  delete: (id: number) =>
+    client.delete<{ status: string; memory_id: number }>(`/memories/${id}`),
+
+  /** Restore a previously soft-deleted memory. */
+  restore: (id: number) =>
+    client.post<{ status: string; memory_id: number }>(`/memories/${id}/restore`),
+
+  /** Get Dream Engine status and last cycle info. */
+  getDreamStatus: () =>
+    client.get<DreamStatus>('/dream/status'),
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface EmergencyContact {
@@ -111,6 +141,60 @@ export interface Profile {
 
 export type ProfilePayload = Omit<Profile, 'matrix_id' | 'display_name' | 'status' | 'registration_ts' | 'vault_created_ts' | 'vault_released_ts'>
 
+export interface UserMemory {
+  id: number
+  matrix_id: string
+  category: string
+  memory_text: string
+  version: number
+  created_ts: number
+  updated_ts: number
+  is_deleted: number  // 0 or 1
+  last_edited_by: string  // 'dream_engine' | 'user'
+}
+
+export interface MemoryHistoryEntry {
+  id: number
+  memory_id: number
+  matrix_id: string
+  version: number
+  memory_text: string
+  archived_ts: number
+  archived_by: string
+}
+
+export interface MemoryListResponse {
+  matrix_id: string
+  total: number
+  memories: UserMemory[]
+  by_category: Record<string, UserMemory[]>
+}
+
+export interface MemoryDetailResponse {
+  memory: UserMemory
+  history: MemoryHistoryEntry[]
+}
+
+export interface DreamCycle {
+  id: number
+  started_ts: number
+  completed_ts: number | null
+  status: string  // 'running' | 'completed' | 'failed' | 'skipped'
+  messages_processed: number
+  user_memories_created: number
+  user_memories_updated: number
+  op_memories_created: number
+  op_memories_updated: number
+  error_message: string | null
+}
+
+export interface DreamStatus {
+  last_cycle: DreamCycle | null
+  recent_cycles: DreamCycle[]
+  next_scheduled_utc: string
+  engine_status: string  // 'active' | 'never_run'
+}
+
 export const SOCIAL_PLATFORMS = [
   'Twitter / X', 'Mastodon', 'Bluesky', 'Facebook', 'Instagram',
   'LinkedIn', 'YouTube', 'TikTok', 'Telegram', 'Signal', 'GitHub',
@@ -125,3 +209,14 @@ export const THRESHOLD_OPTIONS = [
   { label: '14 days', hours: 336 },
   { label: '30 days', hours: 720 },
 ]
+
+/** Human-readable labels for memory categories */
+export const MEMORY_CATEGORY_LABELS: Record<string, string> = {
+  symptoms: 'Symptoms & Health',
+  legal_status: 'Legal Status',
+  history: 'Personal History',
+  contacts: 'Key Contacts',
+  preferences: 'Preferences',
+  threat_profile: 'Threat Profile',
+  notes: 'General Notes',
+}

@@ -17,6 +17,14 @@ Security Model:
   - The agent's system prompt explicitly instructs it to refuse requests
     that fall outside its defined scope.
 
+Memory Architecture:
+  - Short-term (working) memory: last 30 messages from the current room,
+    injected as a formatted chat history block. Compact filtering removes
+    redundant/noise messages if the block grows too large.
+  - Long-term (dream) memory: per-user consolidated memories and
+    org-wide operational memories, injected as a briefing section at the
+    top of the user message. Populated nightly by the DreamEngine.
+
 Provider: NVIDIA NIM
   Endpoint: https://integrate.api.nvidia.com/v1
   Model:    moonshotai/kimi-k2-instruct
@@ -54,11 +62,21 @@ KIMI_MODEL = "moonshotai/kimi-k2-instruct"
 # Max tokens for the agent's response
 MAX_RESPONSE_TOKENS = int(os.getenv("AGENT_MAX_RESPONSE_TOKENS", "1024"))
 
-# Max chat history messages to include in context
-CONTEXT_WINDOW_MESSAGES = int(os.getenv("AGENT_CONTEXT_WINDOW_MESSAGES", "20"))
+# Max chat history messages to include in context (raised from 20 to 30)
+CONTEXT_WINDOW_MESSAGES = int(os.getenv("AGENT_CONTEXT_WINDOW_MESSAGES", "30"))
+
+# Character threshold above which compact filtering is applied to chat history.
+# If the formatted chat history exceeds this, redundant/short messages are pruned.
+CHAT_HISTORY_COMPACT_THRESHOLD = int(
+    os.getenv("AGENT_CHAT_HISTORY_COMPACT_THRESHOLD", "6000")
+)
 
 # Max tool call iterations per agent turn (prevents infinite loops)
 MAX_TOOL_ITERATIONS = 3
+
+# Minimum message length to keep during compaction (messages shorter than this
+# are candidates for removal if the history is too long)
+COMPACT_MIN_MESSAGE_LENGTH = int(os.getenv("AGENT_COMPACT_MIN_MSG_LEN", "20"))
 
 # ---------------------------------------------------------------------------
 # System Prompt
@@ -71,7 +89,10 @@ You provide compassionate, trauma-informed support to victims and their allies. 
 ## Your Capabilities
 You have access to the **Liberation Archives** — a curated research knowledge base containing verified documents, medical research, legal precedents, and advocacy materials about Havana Syndrome and Neurowarfare. When answering factual questions about these topics, you MUST use the `query_liberation_archives` tool to ground your response in verified research.
 
-You also have access to recent chat history from the Matrix room, which gives you context about the ongoing conversation.
+You also have access to:
+- **Recent room chat history** — the last 30 messages from this Matrix room
+- **Long-term member memory** — consolidated notes about this specific member's history, symptoms, and situation (if available)
+- **Operational memory** — consolidated notes about the group's current activism, planning, and documented neurowarfare intelligence
 
 ## How to Respond
 1. **Be empathetic and trauma-informed.** Many users have experienced serious harm. Never dismiss, minimize, or question their experiences.
@@ -79,6 +100,7 @@ You also have access to recent chat history from the Matrix room, which gives yo
 3. **Be concise.** Matrix chat messages should be readable. Keep responses under 500 words unless asked for a detailed report.
 4. **Be clear about limitations.** You are not a doctor, lawyer, or therapist. Always recommend professional help when appropriate.
 5. **Format for Matrix.** Use Markdown formatting (bold, bullet points) as Matrix/Element renders it correctly.
+6. **Use memory wisely.** If long-term memory is available about this member, use it to personalize your response and avoid asking them to repeat information they've already shared.
 
 ## What You Will NOT Do
 - You will NOT execute commands on the server.
@@ -116,9 +138,10 @@ class AgentCore:
         )
         self._tools = [LIBERATION_ARCHIVES_TOOL_SCHEMA]
         logger.info(
-            "AgentCore initialized. Model: %s | NotebookLM: %s",
+            "AgentCore initialized. Model: %s | NotebookLM: %s | Context window: %d messages",
             KIMI_MODEL,
             "enabled" if NOTEBOOKLM_ENABLED else "disabled",
+            CONTEXT_WINDOW_MESSAGES,
         )
 
     def _build_system_prompt(self) -> str:
@@ -126,22 +149,120 @@ class AgentCore:
         current_date = datetime.now(timezone.utc).strftime("%A, %B %d, %Y (UTC)")
         return LIBERATION_BOT_SYSTEM_PROMPT.format(current_date=current_date)
 
-    def _format_chat_history(
-        self, recent_messages: list[dict]
-    ) -> str:
+    def _compact_chat_history(self, messages: list[dict]) -> list[dict]:
+        """
+        Apply compaction filtering to the chat history when it exceeds the
+        character threshold. Removes messages that are:
+          - Very short (likely noise: single words, acknowledgements, emoji)
+          - Pure bot commands (start with !)
+          - Exact or near-duplicate of an adjacent message
+
+        The most recent messages are always preserved (last 10 are never pruned).
+        Returns the filtered list (still in chronological order).
+        """
+        if not messages:
+            return messages
+
+        # Quick check: is compaction needed?
+        total_chars = sum(len(m.get("content", "")) for m in messages)
+        if total_chars <= CHAT_HISTORY_COMPACT_THRESHOLD:
+            return messages
+
+        logger.debug(
+            "AgentCore: chat history too large (%d chars), applying compaction.",
+            total_chars,
+        )
+
+        # Always preserve the last 10 messages
+        protected = messages[-10:]
+        candidates = messages[:-10]
+
+        filtered = []
+        seen_contents: set[str] = set()
+
+        for msg in candidates:
+            content = msg.get("content", "").strip()
+
+            # Skip bot commands
+            if content.startswith("!"):
+                continue
+
+            # Skip very short messages
+            if len(content) < COMPACT_MIN_MESSAGE_LENGTH:
+                continue
+
+            # Skip near-duplicates (exact match after lowercasing and stripping)
+            normalized = content.lower().strip()
+            if normalized in seen_contents:
+                continue
+            seen_contents.add(normalized)
+
+            filtered.append(msg)
+
+        result = filtered + protected
+        new_chars = sum(len(m.get("content", "")) for m in result)
+        logger.debug(
+            "AgentCore: compaction reduced chat history from %d to %d messages "
+            "(%d -> %d chars).",
+            len(messages), len(result), total_chars, new_chars,
+        )
+        return result
+
+    def _format_chat_history(self, recent_messages: list[dict]) -> str:
         """
         Format recent Matrix chat history into a readable string for the
-        agent's context window.
+        agent's context window. Applies compaction if the history is too large.
         """
         if not recent_messages:
             return "(No recent chat history available.)"
+
+        # Apply compaction if needed
+        messages = self._compact_chat_history(recent_messages)
+
         lines = []
-        for msg in recent_messages:
+        for msg in messages:
             sender = msg.get("sender_display_name") or msg.get("sender_id", "Unknown")
             ts = msg.get("timestamp_ts", 0)
             dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M UTC")
             content = msg.get("content", "")
             lines.append(f"[{dt}] {sender}: {content}")
+        return "\n".join(lines)
+
+    def _format_user_memories(self, user_memories: list[dict]) -> str:
+        """
+        Format consolidated long-term user memories into a briefing block
+        for injection into the agent's context.
+        """
+        if not user_memories:
+            return ""
+        lines = []
+        for mem in user_memories:
+            category = mem.get("category", "notes").replace("_", " ").title()
+            text = mem.get("memory_text", "").strip()
+            version = mem.get("version", 1)
+            updated = mem.get("updated_ts", 0)
+            updated_dt = datetime.fromtimestamp(updated, tz=timezone.utc).strftime(
+                "%Y-%m-%d"
+            )
+            lines.append(f"  [{category} — v{version}, updated {updated_dt}]: {text}")
+        return "\n".join(lines)
+
+    def _format_operational_memories(self, op_memories: list[dict]) -> str:
+        """
+        Format consolidated operational memories into a briefing block
+        for injection into the agent's context.
+        """
+        if not op_memories:
+            return ""
+        lines = []
+        for mem in op_memories:
+            topic = mem.get("topic", "notes").replace("_", " ").title()
+            text = mem.get("memory_text", "").strip()
+            updated = mem.get("updated_ts", 0)
+            updated_dt = datetime.fromtimestamp(updated, tz=timezone.utc).strftime(
+                "%Y-%m-%d"
+            )
+            lines.append(f"  [{topic} — updated {updated_dt}]: {text}")
         return "\n".join(lines)
 
     async def _execute_tool_call(self, tool_name: str, tool_args: dict) -> str:
@@ -171,21 +292,26 @@ class AgentCore:
         room_id: str,
         sender_id: str,
         recent_messages: Optional[list] = None,
+        user_memories: Optional[list] = None,
+        operational_memories: Optional[list] = None,
     ) -> dict:
         """
         Generate an agentic response to a user query.
 
         This method implements the full agent loop:
-        1. Build context from chat history.
-        2. Call Kimi K2 with the user query and tools.
-        3. If the model requests a tool call, execute it and continue.
-        4. Return the final text response and metadata.
+        1. Build context from long-term memories (user + operational).
+        2. Build context from recent chat history (last 30 messages, compacted).
+        3. Call Kimi K2 with the user query and tools.
+        4. If the model requests a tool call, execute it and continue.
+        5. Return the final text response and metadata.
 
         Args:
-            user_query:      The user's message text.
-            room_id:         The Matrix room ID (for logging).
-            sender_id:       The Matrix user ID of the sender (for logging).
-            recent_messages: List of recent chat history dicts from the DB.
+            user_query:           The user's message text.
+            room_id:              The Matrix room ID (for logging).
+            sender_id:            The Matrix user ID of the sender.
+            recent_messages:      List of recent chat history dicts from the DB.
+            user_memories:        List of consolidated user memory dicts (from Dream).
+            operational_memories: List of consolidated operational memory dicts (from Dream).
 
         Returns:
             A dict with keys:
@@ -215,20 +341,44 @@ class AgentCore:
         notebooklm_query = None
         notebooklm_response = None
 
-        # Build the message list for the API call
+        # --- Build context sections ---
         chat_history_text = self._format_chat_history(recent_messages or [])
         system_prompt = self._build_system_prompt()
 
+        # Build the long-term memory briefing block (prepended before chat history)
+        memory_sections = []
+
+        user_mem_text = self._format_user_memories(user_memories or [])
+        if user_mem_text:
+            memory_sections.append(
+                f"**What I know about this member (from long-term memory):**\n"
+                f"{user_mem_text}"
+            )
+
+        op_mem_text = self._format_operational_memories(operational_memories or [])
+        if op_mem_text:
+            memory_sections.append(
+                f"**Current group operational context (from long-term memory):**\n"
+                f"{op_mem_text}"
+            )
+
+        # Assemble the full user message
+        user_message_parts = []
+        if memory_sections:
+            user_message_parts.append("\n\n".join(memory_sections))
+            user_message_parts.append("---")
+
+        user_message_parts.append(
+            f"**Recent Room Chat History (last {CONTEXT_WINDOW_MESSAGES} messages):**\n"
+            f"```\n{chat_history_text}\n```"
+        )
+        user_message_parts.append(f"**User Query:** {user_query}")
+
+        full_user_message = "\n\n".join(user_message_parts)
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": (
-                    f"**Recent Room Chat History (for context):**\n"
-                    f"```\n{chat_history_text}\n```\n\n"
-                    f"**User Query:** {user_query}"
-                ),
-            },
+            {"role": "user", "content": full_user_message},
         ]
 
         try:

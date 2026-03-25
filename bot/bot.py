@@ -5,14 +5,15 @@ Liberation Bot — Matrix Orchestrator (Agentic Phase I)
 
 This module wires together all subsystems:
   - Matrix client (simplematrixbotlib / matrix-nio) for E2EE messaging
-  - Database layer (chat history + agent queries + DMS tables)
+  - Database layer (chat history + agent queries + DMS tables + dream memory)
   - Onboarding manager (Dead Man's Switch Phase 1)
   - Heartbeat monitor (Dead Man's Switch Phase 2)
   - OSINT verification pipeline (Dead Man's Switch Phase 3)
   - Consensus manager (Dead Man's Switch Phase 4)
   - Release manager (Dead Man's Switch Phase 5)
   - AgentCore (Kimi K2 via NVIDIA NIM — Phase I Agentic)
-  - APScheduler for periodic heartbeat checks
+  - DreamEngine (nightly memory consolidation — fires at 03:00 UTC)
+  - APScheduler for periodic heartbeat checks and Dream cycles
 
 Dead Man's Switch Commands (unchanged):
   DM Commands:
@@ -27,7 +28,7 @@ Dead Man's Switch Commands (unchanged):
     !cancel_alert <@user:server>     — (Admin) Cancel an active alert
     !help                            — Show command reference
 
-Agentic Commands (NEW — Phase I):
+Agentic Commands (Phase I):
   Group Room or DM:
     @bot <question>  — Ask Liberation Bot about Neurowarfare, Havana Syndrome,
                        AHIs, directed energy weapons, legal options, etc.
@@ -55,6 +56,7 @@ from bot.consensus import ConsensusManager
 from bot.release import ReleaseManager
 from osint.scanner import OSINTScanner
 from agent import AgentCore
+from agent.dreamer import DreamEngine
 from agent.tools import list_liberation_archives_topics
 from bot.video_room import VideoRoomHandler
 
@@ -92,6 +94,10 @@ CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS_THRESHOLD", "3"))
 DEFAULT_THRESHOLD_H = int(os.getenv("DEFAULT_MISSING_THRESHOLD_HOURS", "72"))
 HEARTBEAT_INTERVAL_MIN = int(os.getenv("HEARTBEAT_CHECK_INTERVAL_MINUTES", "60"))
 VIDEO_ROOM_ID = os.getenv("MATRIX_VIDEO_ROOM_ID", "")
+
+# Dream cycle schedule: hour and minute (UTC) when the Dream Engine runs
+DREAM_HOUR_UTC = int(os.getenv("DREAM_HOUR_UTC", "3"))    # 03:00 UTC default
+DREAM_MINUTE_UTC = int(os.getenv("DREAM_MINUTE_UTC", "0"))
 
 # Regex to detect @bot mentions (case-insensitive)
 BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "liberation-bot")
@@ -165,6 +171,10 @@ class LiberationBot:
 
         # --- Agentic Core (Phase I) ---
         self.agent = AgentCore()
+
+        # --- Dream Engine (nightly memory consolidation) ---
+        # Initialised after DB is connected (in _init_modules)
+        self.dream_engine: Optional[DreamEngine] = None
 
         # --- Sub-modules (initialised after DB is ready) ---
         self.onboarding: Optional[OnboardingManager] = None
@@ -260,6 +270,13 @@ class LiberationBot:
             default_threshold_h=DEFAULT_THRESHOLD_H,
         )
 
+        # --- Dream Engine ---
+        self.dream_engine = DreamEngine(db=self.db)
+        logger.info(
+            "DreamEngine initialised. Scheduled for %02d:%02d UTC daily.",
+            DREAM_HOUR_UTC, DREAM_MINUTE_UTC,
+        )
+
         # --- Video Planning Room Handler ---
         if VIDEO_ROOM_ID:
             self.video_handler = VideoRoomHandler(
@@ -308,7 +325,13 @@ class LiberationBot:
     async def _handle_agent_query(self, room, message):
         """
         Handle a natural language query directed at the bot.
-        Saves the message to chat history, calls the agent, and responds.
+
+        Enriches the agent context with:
+          1. Long-term user memories (from Dream consolidation)
+          2. Operational memories relevant to this room
+          3. Last 30 messages of room chat history (with compaction)
+
+        Then calls the agent and logs the interaction.
         """
         sender = message.sender
         room_id = room.room_id
@@ -331,15 +354,28 @@ class LiberationBot:
         # Acknowledge the query
         await self._send_room_message(room_id, "🔍 Searching the Liberation Archives...")
 
-        # Fetch recent chat history for context
-        recent_messages = await self.db.get_recent_messages(room_id, limit=20)
+        # --- Fetch context: short-term chat history (last 30 messages) ---
+        from agent.core import CONTEXT_WINDOW_MESSAGES
+        recent_messages = await self.db.get_recent_messages(
+            room_id, limit=CONTEXT_WINDOW_MESSAGES
+        )
 
-        # Generate the agent response
+        # --- Fetch context: long-term user memories (from Dream) ---
+        user_memories = await self.db.get_user_memories(sender)
+
+        # --- Fetch context: operational memories for this room (top 5) ---
+        operational_memories = await self.db.get_operational_memories(
+            room_id=room_id, limit=5
+        )
+
+        # Generate the agent response with full memory context
         result = await self.agent.generate_response(
             user_query=user_query,
             room_id=room_id,
             sender_id=sender,
             recent_messages=recent_messages,
+            user_memories=user_memories,
+            operational_memories=operational_memories,
         )
 
         # Send the response
@@ -378,7 +414,7 @@ class LiberationBot:
         async def on_any_message(room, message):
             """
             Track ALL messages for:
-              1. Chat history memory (agent context window)
+              1. Chat history memory (agent context window + Dream Engine)
               2. Heartbeat monitoring (Dead Man's Switch)
             """
             sender = message.sender
@@ -556,11 +592,11 @@ class LiberationBot:
                 user = await self.db.get_user(sender)
                 profile = await self.db.get_profile(sender)
                 if user and profile:
-                    import json
+                    import json as _json
                     onb_session = self.onboarding._sessions[sender]
                     onb_session.data["display_name"] = user.get("display_name", sender)
                     onb_session.data["location"] = profile.get("location", "")
-                    onb_session.data["social_handles"] = json.loads(
+                    onb_session.data["social_handles"] = _json.loads(
                         profile.get("social_handles") or "{}"
                     )
                     onb_session.data["threshold_h"] = user.get("missing_threshold_h", 72)
@@ -648,7 +684,9 @@ class LiberationBot:
     # ------------------------------------------------------------------
 
     def _start_scheduler(self):
-        """Start the APScheduler for periodic heartbeat checks."""
+        """Start the APScheduler for periodic heartbeat checks and Dream cycles."""
+
+        # --- Heartbeat check (existing) ---
         self.scheduler.add_job(
             self.heartbeat.run_check,
             "interval",
@@ -656,10 +694,27 @@ class LiberationBot:
             id="heartbeat_check",
             replace_existing=True,
         )
+
+        # --- Dream Engine: nightly memory consolidation ---
+        # Runs at DREAM_HOUR_UTC:DREAM_MINUTE_UTC UTC every day.
+        # misfire_grace_time=3600 means: if the bot was offline at the scheduled
+        # time, run the job as soon as the bot comes back online (up to 1 hour late).
+        self.scheduler.add_job(
+            self.dream_engine.run_dream_cycle,
+            "cron",
+            hour=DREAM_HOUR_UTC,
+            minute=DREAM_MINUTE_UTC,
+            id="dream_cycle",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+
         self.scheduler.start()
         logger.info(
-            "Heartbeat scheduler started (interval: %d minutes).",
+            "Scheduler started. Heartbeat: every %d min | Dream cycle: daily at %02d:%02d UTC.",
             HEARTBEAT_INTERVAL_MIN,
+            DREAM_HOUR_UTC,
+            DREAM_MINUTE_UTC,
         )
 
     # ------------------------------------------------------------------
@@ -673,13 +728,13 @@ class LiberationBot:
         # Connect database
         await self.db.connect()
 
-        # Initialise sub-modules
+        # Initialise sub-modules (including DreamEngine)
         await self._init_modules()
 
         # Register message handlers
         self._register_handlers()
 
-        # Start the periodic heartbeat scheduler
+        # Start the periodic heartbeat + Dream schedulers
         self._start_scheduler()
 
         logger.info(
@@ -698,11 +753,4 @@ def main():
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user.")
-    except Exception as exc:
-        logger.critical("Bot crashed: %s", exc, exc_info=True)
-        raise
-
-
-if __name__ == "__main__":
-    main()
+        logger.info("Liberation Bot stopped by user.")

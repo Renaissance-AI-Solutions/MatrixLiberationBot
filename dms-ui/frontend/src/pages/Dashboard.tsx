@@ -4,13 +4,14 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Shield, LogOut, RefreshCw, CheckCircle2, AlertTriangle, Clock,
   Plus, Trash2, Save, Loader2, User, Phone, Globe, FileText,
-  Bell, History, ChevronDown, ChevronUp, AlertCircle,
+  Bell, History, ChevronDown, ChevronUp, AlertCircle, Brain,
 } from 'lucide-react'
 import {
   profileApi, clearSession, isSessionValid, getMatrixId,
   SOCIAL_PLATFORMS, THRESHOLD_OPTIONS,
 } from '../api'
 import type { Profile, EmergencyContact, SocialMedia, ReleaseAction } from '../api'
+import MemoryProfile from '../components/MemoryProfile'
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -404,6 +405,11 @@ export default function Dashboard() {
               <Plus size={13} /> Add Release Action
             </button>
           </div>
+        </Section>
+
+        {/* ── AI Memory Profile ── */}
+        <Section title="AI Memory Profile" icon={Brain} defaultOpen={false}>
+          <MemoryProfile />
         </Section>
 
         {/* ── Audit Log ── */}

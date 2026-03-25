@@ -9,20 +9,22 @@ A standalone web application that lets registered Liberation Bot users view and 
 ```
 dms-ui/
 ├── backend/          FastAPI (Python) — REST API
-│   ├── main.py       9 API endpoints, JWT auth, OTP flow
+│   ├── main.py       16 API endpoints, JWT auth, OTP flow, Dream memory API
 │   ├── db.py         Async SQLite layer (shares the bot's DB file)
 │   ├── matrix_otp.py OTP delivery via Matrix DM
 │   └── .env.example  Environment variable reference
 └── frontend/         Vite + React + TypeScript + TailwindCSS
     └── src/
-        ├── api.ts          Axios client + session management
+        ├── api.ts          Axios client + session management + memory API types
         ├── App.tsx          Routing + auth guard
+        ├── components/
+        │   └── MemoryProfile.tsx  AI Memory Profile section (Dream Engine UI)
         └── pages/
             ├── Login.tsx    Matrix OTP login flow
-            └── Dashboard.tsx Full profile editor
+            └── Dashboard.tsx Full profile editor (includes AI Memory Profile)
 ```
 
-The backend opens the **same SQLite database file** as Liberation Bot. No data migration is needed — the UI reads and writes to the existing `registered_users`, `user_profiles`, and `emergency_vault` tables, and adds two new UI-specific tables (`dms_otp_challenges`, `dms_ui_profiles`).
+The backend opens the **same SQLite database file** as Liberation Bot. No data migration is needed — the UI reads and writes to the existing `registered_users`, `user_profiles`, and `emergency_vault` tables, and adds UI-specific and Dream memory tables.
 
 ---
 
@@ -47,7 +49,57 @@ This proves the user owns the Matrix account without requiring a separate passwo
 | **Social Media Profiles** | Add/remove platform + URL pairs (used by the OSINT scanner) |
 | **Vault — Final Message** | Write/edit the Markdown final message released when the switch triggers |
 | **Trigger Configuration** | Set the missing threshold (24h–30d) and configure release actions (Matrix DM, Matrix room, webhook) |
-| **Audit Log** | View a timestamped log of all logins, profile changes, and check-ins |
+| **AI Memory Profile** | View, edit, and delete the long-term memories the Dream Engine has consolidated about you. See full version history for every memory. Restore deleted memories. View Dream Engine status and last cycle stats. |
+| **Audit Log** | View a timestamped log of all logins, profile changes, check-ins, and memory edits |
+
+---
+
+## Dream Engine — AI Memory System
+
+Liberation Bot includes a nightly memory consolidation system inspired by Claude Code's "Auto Dream" feature and research into sleep-time compute. The Dream Engine runs at **03:00 UTC** each night and:
+
+1. Reviews all Matrix chat transcripts since the last successful cycle
+2. Extracts information relevant to the NPWA mission (member situations, neurowarfare documentation, operational planning)
+3. Consolidates extracted information into two permanent memory stores:
+   - **User Memories** — per-member long-term memory (symptoms, legal status, history, preferences, threat profile)
+   - **Operational Memories** — org-wide memory (neurowarfare programs, countermeasures, legal strategy, activism planning)
+4. Merges new insights with existing memories, resolving contradictions and incrementing version numbers
+5. Logs every cycle in `dream_cycles` for full auditability
+
+### Memory API Endpoints
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/api/memories` | List all AI memories for the authenticated user |
+| `GET` | `/api/memories/{id}` | Get a single memory with full version history |
+| `PUT` | `/api/memories/{id}` | Edit a memory (user-initiated correction) |
+| `DELETE` | `/api/memories/{id}` | Soft-delete a memory (preserves version history) |
+| `POST` | `/api/memories/{id}/restore` | Restore a soft-deleted memory |
+| `GET` | `/api/dream/status` | Get Dream Engine status, last cycle stats, and next run time |
+
+### Memory Categories (User)
+
+| Category | Contents |
+| :--- | :--- |
+| `symptoms` | Health disclosures, AHI symptoms, medical history |
+| `legal_status` | Ongoing cases, attorneys, jurisdictions, legal strategies |
+| `personal_history` | Background relevant to activism or victimization |
+| `preferences` | Communication preferences, expertise level |
+| `triggers` | Topics or situations that cause distress |
+| `relationships` | Key contacts, allies, adversaries |
+| `notes` | General notes that don't fit other categories |
+
+### Operational Memory Topics
+
+| Topic | Contents |
+| :--- | :--- |
+| `neurowarfare_programs` | Named programs, agencies, technologies, incidents |
+| `countermeasures` | Protection strategies, tools, mitigation techniques |
+| `legal_strategy` | Group-level legal approaches, precedents, filings |
+| `operational_planning` | Activism plans, campaigns, events, timelines |
+| `threat_actors` | Identified individuals, organizations, or agencies |
+| `resources` | Useful documents, contacts, websites, tools |
+| `brainstorming` | Significant ideas or proposals meriting follow-up |
 
 ---
 
@@ -108,4 +160,6 @@ pnpm build
 - Sessions are **JWT-signed** (HS256) and expire after 8 hours.
 - The backend never stores plaintext OTPs.
 - The vault text is stored server-side in the same security boundary as the bot (the server holds the master key for the bot's AES-GCM vault anyway).
-- All profile changes are written to the audit log.
+- All profile changes and memory edits are written to the audit log.
+- The Dream Engine **never reads emergency vault data**. OTP codes and bot commands are stripped from transcripts before LLM processing.
+- User memories are soft-deleted only — version history is always preserved.

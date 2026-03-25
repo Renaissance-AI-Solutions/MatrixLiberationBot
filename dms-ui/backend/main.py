@@ -4,12 +4,20 @@ dms-ui/backend/main.py
 Liberation Bot — Dead Man's Switch Web UI Backend
 
 FastAPI application providing:
-  POST /api/auth/request   — Request OTP (sends via Matrix DM)
-  POST /api/auth/verify    — Verify OTP, receive JWT session
-  GET  /api/profile        — Fetch full combined profile
-  PUT  /api/profile        — Update profile (structured fields + vault text)
-  POST /api/checkin        — Manual check-in (resets the bot's timer)
-  GET  /api/audit          — Audit log for this user
+  POST /api/auth/request         — Request OTP (sends via Matrix DM)
+  POST /api/auth/verify          — Verify OTP, receive JWT session
+  GET  /api/profile              — Fetch full combined profile
+  PUT  /api/profile              — Update profile (structured fields + vault text)
+  POST /api/checkin              — Manual check-in (resets the bot's timer)
+  GET  /api/audit                — Audit log for this user
+
+  --- Dream Memory Endpoints ---
+  GET  /api/memories             — List all AI memories for the authenticated user
+  GET  /api/memories/{id}        — Get a single memory with full version history
+  PUT  /api/memories/{id}        — Edit a memory (user-initiated correction)
+  DELETE /api/memories/{id}      — Soft-delete a memory
+  POST /api/memories/{id}/restore — Restore a soft-deleted memory
+  GET  /api/dream/status         — Get the last Dream cycle status and stats
 """
 
 import json
@@ -158,6 +166,21 @@ class ProfileUpdate(BaseModel):
     vault_text: Optional[str] = None
     missing_threshold_h: Optional[int] = None
     release_actions: Optional[List[ReleaseAction]] = None
+
+
+class MemoryEdit(BaseModel):
+    """Payload for a user-initiated memory edit."""
+    memory_text: str
+
+    @field_validator("memory_text")
+    @classmethod
+    def validate_text(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("memory_text cannot be empty.")
+        if len(v) > 500:
+            raise ValueError("memory_text cannot exceed 500 characters.")
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +378,192 @@ async def get_audit(matrix_id: str = Depends(_get_current_user)):
     """Return the last 50 audit log entries for the authenticated user."""
     entries = await db.get_audit_log(matrix_id)
     return entries
+
+
+# ---------------------------------------------------------------------------
+# Routes — Dream Memory (User Memories)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/memories")
+async def list_memories(
+    include_deleted: bool = False,
+    matrix_id: str = Depends(_get_current_user),
+):
+    """
+    Return all AI-consolidated long-term memories for the authenticated user.
+
+    Each memory includes:
+      - id, category, memory_text, version, created_ts, updated_ts
+      - is_deleted (only visible when include_deleted=true)
+      - last_edited_by: "dream_engine" | "user"
+
+    Memories are grouped by category (symptoms, legal_status, history, etc.)
+    and ordered by most recently updated within each category.
+    """
+    memories = await db.get_user_memories(matrix_id, include_deleted=include_deleted)
+
+    # Group by category for cleaner frontend consumption
+    grouped: Dict[str, List[Dict]] = {}
+    for mem in memories:
+        cat = mem.get("category", "notes")
+        grouped.setdefault(cat, []).append(mem)
+
+    return {
+        "matrix_id": matrix_id,
+        "total": len(memories),
+        "memories": memories,
+        "by_category": grouped,
+    }
+
+
+@app.get("/api/memories/{memory_id}")
+async def get_memory(
+    memory_id: int,
+    matrix_id: str = Depends(_get_current_user),
+):
+    """
+    Return a single memory with its full version history.
+
+    The version history allows users to see every previous state of the memory,
+    including who made each change (dream_engine or user) and when.
+    """
+    memory = await db.get_user_memory_by_id(memory_id, matrix_id)
+    if not memory:
+        raise HTTPException(status_code=404, detail="Memory not found.")
+
+    history = await db.get_user_memory_history(memory_id, matrix_id)
+
+    return {
+        "memory": memory,
+        "history": history,
+    }
+
+
+@app.put("/api/memories/{memory_id}")
+async def edit_memory(
+    memory_id: int,
+    body: MemoryEdit,
+    matrix_id: str = Depends(_get_current_user),
+):
+    """
+    Edit the text of a memory (user-initiated correction).
+
+    The previous version is automatically archived in the version history
+    before the update is applied. The version number is incremented.
+    The memory is marked as last_edited_by = 'user'.
+    """
+    existing = await db.get_user_memory_by_id(memory_id, matrix_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Memory not found.")
+
+    if existing.get("is_deleted"):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot edit a deleted memory. Restore it first.",
+        )
+
+    updated = await db.update_user_memory(
+        memory_id=memory_id,
+        matrix_id=matrix_id,
+        new_text=body.memory_text,
+        edited_by="user",
+    )
+
+    await db.log_event(
+        "UI_MEMORY_EDITED",
+        actor_matrix_id=matrix_id,
+        note=f"memory_id={memory_id} v{updated['version']}",
+    )
+
+    return {
+        "status": "updated",
+        "memory": updated,
+    }
+
+
+@app.delete("/api/memories/{memory_id}")
+async def delete_memory(
+    memory_id: int,
+    matrix_id: str = Depends(_get_current_user),
+):
+    """
+    Soft-delete a memory. The record is retained in the database with
+    is_deleted=1 so the version history is preserved. The memory will
+    no longer be injected into the agent's context.
+
+    Use POST /api/memories/{id}/restore to undo this action.
+    """
+    existing = await db.get_user_memory_by_id(memory_id, matrix_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Memory not found.")
+
+    success = await db.soft_delete_user_memory(memory_id, matrix_id)
+    if not success:
+        raise HTTPException(status_code=409, detail="Memory is already deleted.")
+
+    await db.log_event(
+        "UI_MEMORY_DELETED",
+        actor_matrix_id=matrix_id,
+        note=f"memory_id={memory_id}",
+    )
+
+    return {"status": "deleted", "memory_id": memory_id}
+
+
+@app.post("/api/memories/{memory_id}/restore")
+async def restore_memory(
+    memory_id: int,
+    matrix_id: str = Depends(_get_current_user),
+):
+    """
+    Restore a previously soft-deleted memory. The memory will be
+    re-included in the agent's context on the next query.
+    """
+    existing = await db.get_user_memory_by_id(memory_id, matrix_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Memory not found.")
+
+    success = await db.restore_user_memory(memory_id, matrix_id)
+    if not success:
+        raise HTTPException(status_code=409, detail="Memory is not deleted.")
+
+    await db.log_event(
+        "UI_MEMORY_RESTORED",
+        actor_matrix_id=matrix_id,
+        note=f"memory_id={memory_id}",
+    )
+
+    return {"status": "restored", "memory_id": memory_id}
+
+
+# ---------------------------------------------------------------------------
+# Routes — Dream Engine Status
+# ---------------------------------------------------------------------------
+
+@app.get("/api/dream/status")
+async def get_dream_status(matrix_id: str = Depends(_get_current_user)):
+    """
+    Return the status of the Dream Engine — when it last ran, how many
+    memories were created/updated, and the next scheduled run time.
+
+    This is displayed in the AI Memory Profile section of the portal.
+    """
+    last_cycle = await db.get_last_dream_cycle()
+    recent_cycles = await db.get_dream_cycles(limit=5)
+
+    # Calculate next scheduled run (03:00 UTC)
+    now = datetime.now(timezone.utc)
+    next_run = now.replace(hour=3, minute=0, second=0, microsecond=0)
+    if next_run <= now:
+        from datetime import timedelta as td
+        next_run = next_run + td(days=1)
+
+    return {
+        "last_cycle": last_cycle,
+        "recent_cycles": recent_cycles,
+        "next_scheduled_utc": next_run.isoformat(),
+        "engine_status": "active" if last_cycle else "never_run",
+    }
 
 
 # ---------------------------------------------------------------------------
