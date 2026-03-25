@@ -180,7 +180,7 @@ class LiberationBot:
         self.osint_scanner = OSINTScanner(serpapi_key=SERPAPI_KEY or None)
 
         # --- Agentic Core (Phase I) ---
-        self.agent = AgentCore()
+        self.agent = AgentCore(db=self.db)
 
         # --- Dream Engine (nightly memory consolidation) ---
         # Initialised after DB is connected (in _init_modules)
@@ -399,27 +399,20 @@ class LiberationBot:
         await self._send_room_message(room_id, "🔍 Searching the Liberation Archives...")
 
         # --- Fetch context: short-term chat history (last 30 messages) ---
+        # Long-term memories are NO LONGER pre-fetched here. The agent calls
+        # search_memories on demand via tool use, and writes new memories via
+        # upsert_memory. Both tools are scoped to sender/room_id by AgentCore.
         from agent.core import CONTEXT_WINDOW_MESSAGES
         recent_messages = await self.db.get_recent_messages(
             room_id, limit=CONTEXT_WINDOW_MESSAGES
         )
 
-        # --- Fetch context: long-term user memories (from Dream) ---
-        user_memories = await self.db.get_user_memories(sender)
-
-        # --- Fetch context: operational memories for this room (top 5) ---
-        operational_memories = await self.db.get_operational_memories(
-            room_id=room_id, limit=5
-        )
-
-        # Generate the agent response with full memory context
+        # Generate the agent response (memory tools available via self.agent.db)
         result = await self.agent.generate_response(
             user_query=user_query,
             room_id=room_id,
             sender_id=sender,
             recent_messages=recent_messages,
-            user_memories=user_memories,
-            operational_memories=operational_memories,
         )
 
         # ------------------------------------------------------------------

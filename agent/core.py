@@ -10,7 +10,11 @@ via the NVIDIA NIM OpenAI-compatible API.
 Security Model:
   - The agent is a pure Python function. It has NO access to subprocess,
     os.system, or any server execution environment.
-  - The ONLY tool exposed to the agent is `query_liberation_archives`.
+  - The agent has three permitted tools: query_liberation_archives,
+    search_memories, and upsert_memory.
+  - search_memories and upsert_memory are scoped to the current sender_id
+    and room_id via closure injection — the agent cannot access another
+    user's memories even if it tries to pass a different matrix_id.
   - The agent CANNOT access the emergency vault, user credentials, or
     any sensitive database tables.
   - All agent interactions are logged to the `agent_queries` database table.
@@ -21,9 +25,11 @@ Memory Architecture:
   - Short-term (working) memory: last 30 messages from the current room,
     injected as a formatted chat history block. Compact filtering removes
     redundant/noise messages if the block grows too large.
-  - Long-term (dream) memory: per-user consolidated memories and
-    org-wide operational memories, injected as a briefing section at the
-    top of the user message. Populated nightly by the DreamEngine.
+  - Long-term (active) memory: the agent calls search_memories on demand
+    to retrieve relevant user or operational memories. It calls upsert_memory
+    immediately when a member shares important new information, bypassing the
+    nightly Dream consolidation cycle. This replaces the previous passive bulk
+    injection pattern, which polluted the context window regardless of relevance.
 
 Rate Limiting (three-layer defence):
   1. Global concurrency semaphore (AGENT_MAX_CONCURRENT_CALLS, default 1):
@@ -60,6 +66,10 @@ from agent.tools import (
     query_liberation_archives,
     LIBERATION_ARCHIVES_TOOL_SCHEMA,
     NOTEBOOKLM_ENABLED,
+    search_memories,
+    upsert_memory,
+    SEARCH_MEMORIES_TOOL_SCHEMA,
+    UPSERT_MEMORY_TOOL_SCHEMA,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,10 +141,21 @@ You provide compassionate, trauma-informed support to victims and their allies. 
 ## Your Capabilities
 You have access to the **Liberation Archives** — a curated research knowledge base containing verified documents, medical research, legal precedents, and advocacy materials about Havana Syndrome and Neurowarfare. When answering factual questions about these topics, you MUST use the `query_liberation_archives` tool to ground your response in verified research.
 
+You also have three memory tools:
+
+**`search_memories`** — Search long-term memory for what you already know about this member or the group. Call this proactively when:
+- A member's question may relate to their history, symptoms, legal situation, or past conversations.
+- The group asks about ongoing strategy, documented threat actors, or intelligence the group has previously discussed.
+- You are unsure whether you have relevant prior context — search first, then answer.
+Do NOT dump all memories into your response — use what is relevant.
+
+**`upsert_memory`** — Save an important new fact to long-term memory immediately. Call this when:
+- A member explicitly tells you something significant about themselves (new symptoms, legal developments, personal history, triggers).
+- The group discusses something that should be remembered organizationally (new threat actor, legal strategy decision, operational planning update).
+Do NOT call this for conversational filler. Only save genuinely important new information that should persist across sessions.
+
 You also have access to:
-- **Recent room chat history** — the last 30 messages from this Matrix room
-- **Long-term member memory** — consolidated notes about this specific member's history, symptoms, and situation (if available)
-- **Operational memory** — consolidated notes about the group's current activism, planning, and documented neurowarfare intelligence
+- **Recent room chat history** — the last 30 messages from this Matrix room (provided in every query)
 
 ## How to Respond
 1. **Be empathetic and trauma-informed.** Many users have experienced serious harm. Never dismiss, minimize, or question their experiences.
@@ -142,7 +163,7 @@ You also have access to:
 3. **Be concise.** Matrix chat messages should be readable. Keep responses under 500 words unless asked for a detailed report.
 4. **Be clear about limitations.** You are not a doctor, lawyer, or therapist. Always recommend professional help when appropriate.
 5. **Format for Matrix.** Use Markdown formatting (bold, bullet points) as Matrix/Element renders it correctly.
-6. **Use memory wisely.** If long-term memory is available about this member, use it to personalize your response and avoid asking them to repeat information they've already shared.
+6. **Search before you answer.** If a member's question may relate to their history or the group's prior work, call `search_memories` first. This avoids asking them to repeat information they've already shared.
 
 ## What You Will NOT Do
 - You will NOT execute commands on the server.
@@ -173,7 +194,14 @@ class AgentCore:
       3. 429 retry-with-backoff — handled inside _call_llm_with_retry().
     """
 
-    def __init__(self):
+    def __init__(self, db=None):
+        """
+        Args:
+            db: Optional Database instance. When provided, the agent gains
+                access to search_memories and upsert_memory tools. When None
+                (e.g. in tests or standalone use), memory tools are silently
+                disabled and only query_liberation_archives is registered.
+        """
         if not NVIDIA_API_KEY:
             logger.warning(
                 "NVIDIA_API_KEY is not set. The agent will not be able to respond. "
@@ -183,13 +211,21 @@ class AgentCore:
             api_key=NVIDIA_API_KEY or "not-set",
             base_url=NVIDIA_API_BASE,
         )
+        # Store the DB reference for tool closure injection
+        self.db = db
+
+        # Register tools — memory tools only available when db is provided
         self._tools = [LIBERATION_ARCHIVES_TOOL_SCHEMA]
+        if self.db is not None:
+            self._tools += [SEARCH_MEMORIES_TOOL_SCHEMA, UPSERT_MEMORY_TOOL_SCHEMA]
+
         logger.info(
             "AgentCore initialized. Model: %s | NotebookLM: %s | "
-            "Context window: %d messages | Max concurrent calls: %d | "
-            "Max retries on 429: %d",
+            "Memory tools: %s | Context window: %d messages | "
+            "Max concurrent calls: %d | Max retries on 429: %d",
             KIMI_MODEL,
             "enabled" if NOTEBOOKLM_ENABLED else "disabled",
+            "enabled" if self.db is not None else "disabled (no db)",
             CONTEXT_WINDOW_MESSAGES,
             AGENT_MAX_CONCURRENT_CALLS,
             AGENT_MAX_RETRIES,
@@ -347,66 +383,68 @@ class AgentCore:
             lines.append(f"[{dt}] {sender}: {content}")
         return "\n".join(lines)
 
-    def _format_user_memories(self, user_memories: list[dict]) -> str:
-        """
-        Format consolidated long-term user memories into a briefing block
-        for injection into the agent's context.
-        """
-        if not user_memories:
-            return ""
-        lines = []
-        for mem in user_memories:
-            category = mem.get("category", "notes").replace("_", " ").title()
-            text = mem.get("memory_text", "").strip()
-            version = mem.get("version", 1)
-            updated = mem.get("updated_ts", 0)
-            updated_dt = datetime.fromtimestamp(updated, tz=timezone.utc).strftime(
-                "%Y-%m-%d"
-            )
-            lines.append(f"  [{category} — v{version}, updated {updated_dt}]: {text}")
-        return "\n".join(lines)
-
-    def _format_operational_memories(self, op_memories: list[dict]) -> str:
-        """
-        Format consolidated operational memories into a briefing block
-        for injection into the agent's context.
-        """
-        if not op_memories:
-            return ""
-        lines = []
-        for mem in op_memories:
-            topic = mem.get("topic", "notes").replace("_", " ").title()
-            text = mem.get("memory_text", "").strip()
-            updated = mem.get("updated_ts", 0)
-            updated_dt = datetime.fromtimestamp(updated, tz=timezone.utc).strftime(
-                "%Y-%m-%d"
-            )
-            lines.append(f"  [{topic} — updated {updated_dt}]: {text}")
-        return "\n".join(lines)
-
     # ------------------------------------------------------------------
     # Tool execution
     # ------------------------------------------------------------------
 
-    async def _execute_tool_call(self, tool_name: str, tool_args: dict) -> str:
+    async def _execute_tool_call(
+        self,
+        tool_name: str,
+        tool_args: dict,
+        sender_id: str,
+        room_id: str,
+    ) -> str:
         """
         Execute a tool call requested by the agent.
-        Only whitelisted tools are permitted.
+
+        Only whitelisted tools are permitted. sender_id and room_id are
+        injected here as closures — the agent cannot override them via
+        tool arguments, ensuring memory tools are always scoped to the
+        current user and room.
+
+        Args:
+            tool_name:  The function name from the tool call.
+            tool_args:  Parsed JSON arguments from the tool call.
+            sender_id:  Matrix ID of the current user (injected, not from agent).
+            room_id:    Matrix room ID of the current conversation (injected).
         """
         if tool_name == "query_liberation_archives":
             query = tool_args.get("query", "")
             if not query:
                 return "[Error] query_liberation_archives called with empty query."
             return await query_liberation_archives(query)
+
+        elif tool_name == "search_memories":
+            return await search_memories(
+                query=tool_args.get("query", ""),
+                db=self.db,
+                sender_id=sender_id,   # injected — agent cannot override
+                room_id=room_id,       # injected — agent cannot override
+                memory_type=tool_args.get("memory_type", "both"),
+                limit=tool_args.get("limit", 5),
+            )
+
+        elif tool_name == "upsert_memory":
+            return await upsert_memory(
+                memory_type=tool_args.get("memory_type", ""),
+                category=tool_args.get("category", ""),
+                memory_text=tool_args.get("memory_text", ""),
+                db=self.db,
+                sender_id=sender_id,   # injected — agent cannot override
+                room_id=room_id,       # injected — agent cannot override
+                confidence=tool_args.get("confidence", 0.8),
+            )
+
         else:
             # This should never happen given the strict tool schema, but
             # we log it as a security event if it does.
             logger.warning(
-                "SECURITY: Agent attempted to call unauthorized tool: %s", tool_name
+                "SECURITY: Agent attempted to call unauthorized tool: %s (sender=%s)",
+                tool_name, sender_id,
             )
             return (
                 f"[Security Restriction] Tool '{tool_name}' is not available. "
-                f"Only 'query_liberation_archives' is permitted."
+                f"Permitted tools: query_liberation_archives, search_memories, upsert_memory."
             )
 
     # ------------------------------------------------------------------
@@ -419,27 +457,30 @@ class AgentCore:
         room_id: str,
         sender_id: str,
         recent_messages: Optional[list] = None,
-        user_memories: Optional[list] = None,
-        operational_memories: Optional[list] = None,
     ) -> dict:
         """
         Generate an agentic response to a user query.
 
         This method implements the full agent loop:
-        1. Build context from long-term memories (user + operational).
-        2. Build context from recent chat history (last 30 messages, compacted).
+        1. Build context from recent chat history (last 30 messages, compacted).
+        2. Append a minimal memory hint if memory tools are available.
         3. Acquire the global LLM semaphore (queues if another call is in flight).
         4. Call Kimi K2 with the user query and tools (with 429 retry-backoff).
-        5. If the model requests a tool call, execute it and continue.
+        5. If the model requests a tool call, execute it (with sender_id/room_id
+           injected as closures) and continue the loop.
         6. Release the semaphore and return the final text response + metadata.
 
+        Long-term memory is NO LONGER pre-fetched and bulk-injected. The agent
+        calls search_memories on demand when it needs context about the member
+        or the group. This keeps the context window clean and ensures only
+        relevant memories are retrieved. The agent also calls upsert_memory
+        immediately when a member shares important new information.
+
         Args:
-            user_query:           The user's message text.
-            room_id:              The Matrix room ID (for logging).
-            sender_id:            The Matrix user ID of the sender.
-            recent_messages:      List of recent chat history dicts from the DB.
-            user_memories:        List of consolidated user memory dicts (from Dream).
-            operational_memories: List of consolidated operational memory dicts (from Dream).
+            user_query:       The user's message text.
+            room_id:          The Matrix room ID (for logging and tool scoping).
+            sender_id:        The Matrix user ID of the sender (for tool scoping).
+            recent_messages:  List of recent chat history dicts from the DB.
 
         Returns:
             A dict with keys:
@@ -476,34 +517,26 @@ class AgentCore:
         chat_history_text = self._format_chat_history(recent_messages or [])
         system_prompt = self._build_system_prompt()
 
-        # Build the long-term memory briefing block (prepended before chat history)
-        memory_sections = []
-
-        user_mem_text = self._format_user_memories(user_memories or [])
-        if user_mem_text:
-            memory_sections.append(
-                f"**What I know about this member (from long-term memory):**\n"
-                f"{user_mem_text}"
-            )
-
-        op_mem_text = self._format_operational_memories(operational_memories or [])
-        if op_mem_text:
-            memory_sections.append(
-                f"**Current group operational context (from long-term memory):**\n"
-                f"{op_mem_text}"
-            )
-
-        # Assemble the full user message
+        # Assemble the full user message.
+        # Long-term memory is NOT pre-injected here. The agent calls
+        # search_memories on demand via tool use when it needs prior context.
+        # A minimal hint is appended so the agent knows memory tools are
+        # available without being told what is in them.
         user_message_parts = []
-        if memory_sections:
-            user_message_parts.append("\n\n".join(memory_sections))
-            user_message_parts.append("---")
 
         user_message_parts.append(
             f"**Recent Room Chat History (last {CONTEXT_WINDOW_MESSAGES} messages):**\n"
             f"```\n{chat_history_text}\n```"
         )
         user_message_parts.append(f"**User Query:** {user_query}")
+
+        # Append memory hint only when memory tools are available
+        if self.db is not None:
+            user_message_parts.append(
+                "**Member context hint:** Use the `search_memories` tool to recall "
+                "what you know about this member or the group before answering "
+                "questions that may benefit from prior history."
+            )
 
         full_user_message = "\n\n".join(user_message_parts)
 
@@ -605,7 +638,9 @@ class AgentCore:
                         if tool_name == "query_liberation_archives":
                             notebooklm_query = tool_args.get("query", "")
 
-                        tool_result = await self._execute_tool_call(tool_name, tool_args)
+                        tool_result = await self._execute_tool_call(
+                                tool_name, tool_args, sender_id, room_id
+                            )
 
                         if tool_name == "query_liberation_archives":
                             notebooklm_response = tool_result
