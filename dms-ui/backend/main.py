@@ -599,6 +599,113 @@ async def get_dream_status(matrix_id: str = Depends(_get_current_user)):
 
 
 # ---------------------------------------------------------------------------
+# Routes — FOIA Requests
+# ---------------------------------------------------------------------------
+
+class FOIAStatusUpdate(BaseModel):
+    """Payload for updating a FOIA request status from the portal."""
+    status: str
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, v: str) -> str:
+        valid = {"SUBMITTED", "RESPONDED", "APPEALED", "CLOSED"}
+        v = v.strip().upper()
+        if v not in valid:
+            raise ValueError(f"Invalid status. Must be one of: {', '.join(sorted(valid))}")
+        return v
+
+
+@app.get("/api/foia")
+async def list_foia_requests(matrix_id: str = Depends(_get_current_user)):
+    """
+    Return all FOIA requests for the authenticated user, including full
+    lifecycle metadata (submission date, deadline, status, appeal status).
+    Ordered newest-first.
+    """
+    if not _BOT_DB_AVAILABLE or not db._bot_db:
+        raise HTTPException(
+            status_code=503,
+            detail="FOIA data is not available — bot database connection not established.",
+        )
+    requests = await db._bot_db.get_foia_requests_full_for_user(matrix_id, limit=50)
+    return {"requests": requests, "count": len(requests)}
+
+
+@app.get("/api/foia/{request_id}")
+async def get_foia_request(
+    request_id: int,
+    matrix_id: str = Depends(_get_current_user),
+):
+    """
+    Return the full detail of a single FOIA request, including the draft
+    letter and appeal letter (if any).
+    """
+    if not _BOT_DB_AVAILABLE or not db._bot_db:
+        raise HTTPException(status_code=503, detail="Bot database not available.")
+    req = await db._bot_db.get_foia_request_by_id(request_id, matrix_id)
+    if not req:
+        raise HTTPException(
+            status_code=404,
+            detail=f"FOIA request #{request_id} not found.",
+        )
+    return req
+
+
+@app.put("/api/foia/{request_id}/status")
+async def update_foia_status(
+    request_id: int,
+    body: FOIAStatusUpdate,
+    matrix_id: str = Depends(_get_current_user),
+):
+    """
+    Update the status of a FOIA request from the portal.
+    Valid transitions: SUBMITTED → RESPONDED, APPEALED, CLOSED.
+    """
+    if not _BOT_DB_AVAILABLE or not db._bot_db:
+        raise HTTPException(status_code=503, detail="Bot database not available.")
+    req = await db._bot_db.get_foia_request_by_id(request_id, matrix_id)
+    if not req:
+        raise HTTPException(status_code=404, detail=f"FOIA request #{request_id} not found.")
+    ok = await db._bot_db.update_foia_request_status(
+        request_id=request_id,
+        sender_id=matrix_id,
+        status=body.status,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to update status.")
+    await db.log_event(
+        "UI_FOIA_STATUS_UPDATED",
+        actor_matrix_id=matrix_id,
+        note=f"request_id={request_id} status={body.status}",
+    )
+    return {"status": "updated", "request_id": request_id, "new_status": body.status}
+
+
+@app.get("/api/foia/{request_id}/letter")
+async def download_foia_letter(
+    request_id: int,
+    matrix_id: str = Depends(_get_current_user),
+):
+    """
+    Return the full draft letter text for a FOIA request.
+    Used by the portal to enable copy-to-clipboard and download.
+    """
+    if not _BOT_DB_AVAILABLE or not db._bot_db:
+        raise HTTPException(status_code=503, detail="Bot database not available.")
+    req = await db._bot_db.get_foia_request_by_id(request_id, matrix_id)
+    if not req:
+        raise HTTPException(status_code=404, detail=f"FOIA request #{request_id} not found.")
+    return {
+        "request_id": request_id,
+        "target_agency": req.get("target_agency", ""),
+        "jurisdiction_code": req.get("jurisdiction_code", ""),
+        "draft_letter": req.get("draft_letter", ""),
+        "appeal_letter": req.get("appeal_letter", ""),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
 

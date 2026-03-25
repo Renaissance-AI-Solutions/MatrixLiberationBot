@@ -100,6 +100,29 @@ export const memoryApi = {
     client.get<DreamStatus>('/dream/status'),
 }
 
+// ── FOIA Requests ────────────────────────────────────────────────────────────
+
+export const foiaApi = {
+  /** List all FOIA requests for the current user. */
+  list: () =>
+    client.get<{ requests: FoiaRequest[]; count: number }>('/foia'),
+
+  /** Get full detail of a single FOIA request including letters. */
+  get: (id: number) =>
+    client.get<FoiaRequest>(`/foia/${id}`),
+
+  /** Update the status of a FOIA request. */
+  updateStatus: (id: number, status: string) =>
+    client.put<{ status: string; request_id: number; new_status: string }>(
+      `/foia/${id}/status`,
+      { status },
+    ),
+
+  /** Get the full letter text for a FOIA request (for copy/download). */
+  getLetter: (id: number) =>
+    client.get<FoiaLetterResponse>(`/foia/${id}/letter`),
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface EmergencyContact {
@@ -209,6 +232,30 @@ export const THRESHOLD_OPTIONS = [
   { label: '14 days', hours: 336 },
   { label: '30 days', hours: 720 },
 ]
+
+export interface FoiaRequest {
+  id: number
+  sender_id: string
+  jurisdiction_code: string
+  target_agency: string
+  subject_summary: string
+  status: string           // DRAFT | FINALIZED | SUBMITTED | RESPONDED | APPEALED | CLOSED
+  appeal_status: string | null  // null | FILED
+  created_ts: number
+  confirmed_ts: number | null
+  submitted_ts: number | null
+  expected_response_date: number | null
+  draft_letter?: string
+  appeal_letter?: string | null
+}
+
+export interface FoiaLetterResponse {
+  request_id: number
+  target_agency: string
+  jurisdiction_code: string
+  draft_letter: string
+  appeal_letter: string | null
+}
 
 /** Human-readable labels for memory categories */
 export const MEMORY_CATEGORY_LABELS: Record<string, string> = {

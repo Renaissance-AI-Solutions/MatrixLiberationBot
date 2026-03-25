@@ -17,6 +17,10 @@ from .dms_tools import (
     get_dms_status,
     GET_DMS_STATUS_TOOL_SCHEMA,
 )
+from .web_search import (
+    tiered_search,
+    WEB_SEARCH_TOOL_SCHEMA,
+)
 
 __all__ = [
     # Liberation Archives
@@ -34,4 +38,7 @@ __all__ = [
     # DMS tools
     "get_dms_status",
     "GET_DMS_STATUS_TOOL_SCHEMA",
+    # Web search
+    "tiered_search",
+    "WEB_SEARCH_TOOL_SCHEMA",
 ]

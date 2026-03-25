@@ -60,12 +60,15 @@ from agent.dreamer import DreamEngine
 from agent.tools import list_liberation_archives_topics
 from bot.video_room import VideoRoomHandler
 from bot.foia_session import FOIASessionManager, FOIASessionState
+from bot.foia_deadline_monitor import FOIADeadlineMonitor
 from agent.foia_dialogue import FOIADialogueAgent
+from agent.foia_appeal_agent import FOIAAppealAgent
 from agent.tools.foia_jurisdictions import (
     format_jurisdiction_summary,
     format_federal_agencies_summary,
     list_jurisdiction_codes,
 )
+from agent.tools.web_search import run_watched_topic_scan
 
 # Load environment variables from .env file
 load_dotenv()
@@ -105,6 +108,12 @@ VIDEO_ROOM_ID = os.getenv("MATRIX_VIDEO_ROOM_ID", "")
 # Dream cycle schedule: hour and minute (UTC) when the Dream Engine runs
 DREAM_HOUR_UTC = int(os.getenv("DREAM_HOUR_UTC", "3"))    # 03:00 UTC default
 DREAM_MINUTE_UTC = int(os.getenv("DREAM_MINUTE_UTC", "0"))
+
+# FOIA deadline reminder check interval (minutes)
+FOIA_DEADLINE_CHECK_INTERVAL_MIN = int(os.getenv("FOIA_DEADLINE_CHECK_INTERVAL_MINUTES", "360"))  # 6 hours
+
+# Watched topic scan interval (minutes) — 0 to disable
+WATCHED_TOPIC_SCAN_INTERVAL_MIN = int(os.getenv("WATCHED_TOPIC_SCAN_INTERVAL_MINUTES", "720"))  # 12 hours
 
 # ---------------------------------------------------------------------------
 # Rate limiting — Layer 2: per-user cooldown
@@ -159,6 +168,10 @@ HELP_TEXT = """
 - `!foia_confirm` — Accept the draft and receive submission instructions.
 - `!foia_cancel` — Cancel the current drafting session.
 - `!foia_history` — Show your past finalized FOIA requests.
+- `!foia_submit <id>` — Mark a finalized request as physically submitted and start deadline tracking.
+- `!foia_status <id> <status>` — Update a request status (`RESPONDED`, `APPEALED`, `CLOSED`).
+- `!foia_deadlines` — View all submitted requests with their statutory response deadlines.
+- `!foia_appeal <id>` — Draft an appeal letter for a denied or overdue request.
 
 **Video Planning Room (Video Planning and Generation room only):**
 - `!video_start` — Begin a new video planning session. Liberation Bot will lead a dialogue with the group, ask questions, and build the prompts automatically.
@@ -247,6 +260,8 @@ class LiberationBot:
         # --- FOIA subsystem (initialised in _init_modules after DB is ready) ---
         self.foia_manager: Optional[FOIASessionManager] = None
         self.foia_agent: Optional[FOIADialogueAgent] = None
+        self.foia_appeal_agent: Optional[FOIAAppealAgent] = None
+        self.foia_deadline_monitor: Optional[FOIADeadlineMonitor] = None
 
         # --- Scheduler ---
         self.scheduler = AsyncIOScheduler()
@@ -354,10 +369,15 @@ class LiberationBot:
                 "Add it to .env to enable the video workflow."
             )
 
-        # --- FOIA Session Manager and Dialogue Agent ---
+        # --- FOIA Session Manager, Dialogue Agent, Appeal Agent, and Deadline Monitor ---
         self.foia_manager = FOIASessionManager()
         self.foia_agent = FOIADialogueAgent()
-        logger.info("FOIA session manager and dialogue agent initialised.")
+        self.foia_appeal_agent = FOIAAppealAgent()
+        self.foia_deadline_monitor = FOIADeadlineMonitor(
+            db=self.db,
+            on_reminder=self._send_dm,
+        )
+        logger.info("FOIA session manager, dialogue agent, appeal agent, and deadline monitor initialised.")
 
         logger.info("All sub-modules initialised.")
 
@@ -1074,6 +1094,290 @@ class LiberationBot:
                 ]
                 await self.bot.api.send_markdown_message(room.room_id, "\n".join(lines))
 
+        # ---- DM: !foia_submit <request_id> ----
+        @self.bot.listener.on_message_event
+        async def on_foia_submit(room, message):
+            match = botlib.MessageMatch(room, message, self.bot, prefix="!")
+            if (
+                match.is_not_from_this_bot()
+                and room.room_id != GROUP_ROOM_ID
+                and room.room_id != VIDEO_ROOM_ID
+                and match.prefix()
+                and match.command("foia_submit")
+            ):
+                sender = message.sender
+                args = match.args()
+                if not args or not args[0].isdigit():
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        "Usage: `!foia_submit <request_id>`\n"
+                        "Example: `!foia_submit 3`\n\n"
+                        "Use `!foia_history` to find your request IDs.",
+                    )
+                    return
+                request_id = int(args[0])
+                req = await self.db.get_foia_request_by_id(request_id, sender)
+                if not req:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        f"Request #{request_id} not found or does not belong to you.",
+                    )
+                    return
+                if req["status"] not in ("FINALIZED", "DRAFT"):
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        f"Request #{request_id} has status **{req['status']}** and cannot "
+                        f"be marked as submitted again.",
+                    )
+                    return
+                # Calculate the expected response deadline from jurisdiction data
+                from agent.tools.foia_jurisdictions import calculate_foia_deadline
+                from datetime import datetime, timezone as _tz
+                submitted_ts = time.time()
+                expected_dt = calculate_foia_deadline(
+                    req["jurisdiction_code"], submitted_ts
+                )
+                expected_ts = expected_dt.timestamp()
+                ok = await self.db.mark_foia_submitted(
+                    request_id=request_id,
+                    sender_id=sender,
+                    submitted_ts=submitted_ts,
+                    expected_response_date=expected_ts,
+                )
+                if not ok:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        "Failed to update request status. Please try again.",
+                    )
+                    return
+                deadline_str = expected_dt.strftime("%Y-%m-%d")
+                await self.db.log_event(
+                    event_type="FOIA_REQUEST_SUBMITTED",
+                    actor_matrix_id=sender,
+                    note=f"Request #{request_id} | Agency: {req['target_agency']} | Deadline: {deadline_str}",
+                )
+                await self.bot.api.send_markdown_message(
+                    room.room_id,
+                    f"**Request #{request_id} marked as submitted.**\n\n"
+                    f"Agency: **{req['target_agency']}** ({req['jurisdiction_code']})\n"
+                    f"Statutory response deadline: **{deadline_str}**\n\n"
+                    f"Liberation Bot will send you a reminder if the deadline passes "
+                    f"without a response. Use `!foia_status {request_id}` to update "
+                    f"the status when you receive a response.",
+                )
+
+        # ---- DM: !foia_status <request_id> <new_status> ----
+        @self.bot.listener.on_message_event
+        async def on_foia_status(room, message):
+            match = botlib.MessageMatch(room, message, self.bot, prefix="!")
+            if (
+                match.is_not_from_this_bot()
+                and room.room_id != GROUP_ROOM_ID
+                and room.room_id != VIDEO_ROOM_ID
+                and match.prefix()
+                and match.command("foia_status")
+            ):
+                sender = message.sender
+                args = match.args()
+                VALID_STATUSES = ["SUBMITTED", "RESPONDED", "APPEALED", "CLOSED"]
+                if len(args) < 2 or not args[0].isdigit() or args[1].upper() not in VALID_STATUSES:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        "Usage: `!foia_status <request_id> <status>`\n"
+                        f"Valid statuses: {', '.join(f'`{s}`' for s in VALID_STATUSES)}\n\n"
+                        "Example: `!foia_status 3 RESPONDED`",
+                    )
+                    return
+                request_id = int(args[0])
+                new_status = args[1].upper()
+                req = await self.db.get_foia_request_by_id(request_id, sender)
+                if not req:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        f"Request #{request_id} not found or does not belong to you.",
+                    )
+                    return
+                ok = await self.db.update_foia_request_status(
+                    request_id=request_id,
+                    sender_id=sender,
+                    status=new_status,
+                )
+                if not ok:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id, "Failed to update status. Please try again."
+                    )
+                    return
+                await self.db.log_event(
+                    event_type="FOIA_STATUS_UPDATED",
+                    actor_matrix_id=sender,
+                    note=f"Request #{request_id} -> {new_status}",
+                )
+                status_notes = {
+                    "RESPONDED": "Great news! Log the response details for your records. "
+                                 "If the response was a denial, use `!foia_appeal {request_id}` "
+                                 "to draft an appeal letter.",
+                    "APPEALED":  "Your appeal has been logged. Liberation Bot will track the "
+                                 "appeal timeline.",
+                    "CLOSED":    "This request has been closed and archived.",
+                    "SUBMITTED": "Status reset to SUBMITTED.",
+                }
+                note = status_notes.get(new_status, "")
+                await self.bot.api.send_markdown_message(
+                    room.room_id,
+                    f"**Request #{request_id} status updated to `{new_status}`.**\n\n{note}",
+                )
+
+        # ---- DM: !foia_deadlines ----
+        @self.bot.listener.on_message_event
+        async def on_foia_deadlines(room, message):
+            match = botlib.MessageMatch(room, message, self.bot, prefix="!")
+            if (
+                match.is_not_from_this_bot()
+                and room.room_id != GROUP_ROOM_ID
+                and room.room_id != VIDEO_ROOM_ID
+                and match.prefix()
+                and match.command("foia_deadlines")
+            ):
+                sender = message.sender
+                requests = await self.db.get_foia_requests_with_deadlines(sender)
+                if not requests:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        "You have no submitted FOIA requests with tracked deadlines.\n\n"
+                        "Use `!foia_submit <id>` after submitting a request to start "
+                        "deadline tracking.",
+                    )
+                    return
+                from datetime import datetime, timezone as _tz
+                now_ts = time.time()
+                lines = [
+                    "## FOIA Deadline Tracker",
+                    "",
+                    "| # | Agency | Jurisdiction | Deadline | Days Remaining |",
+                    "|---|---|---|---|---|",
+                ]
+                for req in requests:
+                    deadline_str = datetime.fromtimestamp(
+                        req["expected_response_date"], tz=_tz.utc
+                    ).strftime("%Y-%m-%d")
+                    days_left = (req["expected_response_date"] - now_ts) / 86400
+                    if days_left < 0:
+                        days_label = f"**OVERDUE ({abs(int(days_left))}d)**"
+                    elif days_left < 2:
+                        days_label = f"**{days_left:.1f}d (URGENT)**"
+                    else:
+                        days_label = f"{int(days_left)}d"
+                    lines.append(
+                        f"| {req['id']} | {req['target_agency']} "
+                        f"| `{req['jurisdiction_code']}` | {deadline_str} | {days_label} |"
+                    )
+                lines += [
+                    "",
+                    "Use `!foia_status <id> RESPONDED` when you receive a response, "
+                    "or `!foia_appeal <id>` to draft an appeal for overdue requests.",
+                ]
+                await self.bot.api.send_markdown_message(room.room_id, "\n".join(lines))
+
+        # ---- DM: !foia_appeal <request_id> [denial_reason] ----
+        @self.bot.listener.on_message_event
+        async def on_foia_appeal(room, message):
+            match = botlib.MessageMatch(room, message, self.bot, prefix="!")
+            if (
+                match.is_not_from_this_bot()
+                and room.room_id != GROUP_ROOM_ID
+                and room.room_id != VIDEO_ROOM_ID
+                and match.prefix()
+                and match.command("foia_appeal")
+            ):
+                sender = message.sender
+                args = match.args()
+                if not args or not args[0].isdigit():
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        "Usage: `!foia_appeal <request_id> [denial reason]`\n\n"
+                        "**Examples:**\n"
+                        "- `!foia_appeal 3` — Appeal based on no response (constructive denial)\n"
+                        "- `!foia_appeal 3 Exemption 5 deliberative process` — Appeal a specific denial\n\n"
+                        "Use `!foia_history` to find your request IDs.",
+                    )
+                    return
+                request_id = int(args[0])
+                denial_reason = " ".join(args[1:]).strip() if len(args) > 1 else None
+
+                req = await self.db.get_foia_request_by_id(request_id, sender)
+                if not req:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        f"Request #{request_id} not found or does not belong to you.",
+                    )
+                    return
+                if req["status"] not in ("SUBMITTED", "RESPONDED", "APPEALED", "FINALIZED"):
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        f"Request #{request_id} has status **{req['status']}**. "
+                        f"You can only appeal requests that have been submitted or responded to.",
+                    )
+                    return
+
+                await self.bot.api.send_markdown_message(
+                    room.room_id,
+                    f"Drafting appeal letter for Request #{request_id}...\n"
+                    f"Agency: **{req['target_agency']}** | Jurisdiction: `{req['jurisdiction_code']}`",
+                )
+
+                result = await self.foia_appeal_agent.draft_appeal(
+                    original_request=req,
+                    denial_reason=denial_reason,
+                )
+
+                if not result.success:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        f"Failed to draft appeal letter: {result.error}\n"
+                        f"Please try again or contact support.",
+                    )
+                    return
+
+                # Save the appeal letter to the DB
+                await self.db.save_foia_appeal(
+                    request_id=request_id,
+                    sender_id=sender,
+                    appeal_letter=result.appeal_letter,
+                )
+                await self.db.log_event(
+                    event_type="FOIA_APPEAL_DRAFTED",
+                    actor_matrix_id=sender,
+                    note=f"Request #{request_id} | Agency: {req['target_agency']} | Basis: {result.legal_basis}",
+                )
+
+                # Send the appeal letter
+                await self.bot.api.send_markdown_message(
+                    room.room_id,
+                    f"**Appeal Letter for Request #{request_id}**\n"
+                    f"Legal basis: _{result.legal_basis}_\n"
+                    f"Appeal authority: _{result.appeal_authority}_\n"
+                    f"Estimated response deadline: {result.estimated_appeal_deadline_days} business days",
+                )
+                await self.bot.api.send_markdown_message(
+                    room.room_id,
+                    f"```\n{result.appeal_letter}\n```",
+                )
+
+                # Send key arguments as a follow-up
+                if result.key_arguments:
+                    arg_lines = ["**Key Arguments in This Appeal:**", ""]
+                    for i, arg in enumerate(result.key_arguments, 1):
+                        arg_lines.append(f"{i}. {arg}")
+                    arg_lines += [
+                        "",
+                        f"This appeal has been saved to your FOIA history (Request #{request_id}, "
+                        f"status: APPEALED). Use `!foia_status {request_id} CLOSED` to close "
+                        f"this request once resolved.",
+                    ]
+                    await self.bot.api.send_markdown_message(
+                        room.room_id, "\n".join(arg_lines)
+                    )
+
         # ====================================================================
         # End FOIA Commands
         # ====================================================================
@@ -1122,6 +1426,39 @@ class LiberationBot:
                 await self.bot.api.send_markdown_message(room.room_id, response)
 
     # ------------------------------------------------------------------
+    # Watched Topic Scanner
+    # ------------------------------------------------------------------
+
+    async def _run_watched_topic_scan(self) -> None:
+        """
+        Scheduled job: scan all watched topics via the tiered web search tool
+        and post a digest to the group room when new results are found.
+        """
+        logger.info("Running watched topic scan...")
+
+        async def _on_results(topic: str, response) -> None:
+            lines = [
+                f"**Watched Topic Alert** — _{topic}_",
+                "",
+                f"New web results found ({response.tier_used}):",
+                "",
+            ]
+            for i, r in enumerate(response.results, 1):
+                lines.append(f"{i}. **{r.title}**")
+                lines.append(f"   {r.snippet[:200]}")
+                lines.append(f"   {r.url}")
+                lines.append("")
+            lines.append(
+                "_Use `@bot` to ask Liberation Bot to analyze any of these results._"
+            )
+            await self._send_group_message("\n".join(lines))
+
+        try:
+            await run_watched_topic_scan(on_results=_on_results, max_results_per_topic=3)
+        except Exception as exc:
+            logger.error("Watched topic scan failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Scheduler
     # ------------------------------------------------------------------
 
@@ -1151,12 +1488,33 @@ class LiberationBot:
             misfire_grace_time=3600,
         )
 
+        # --- FOIA Deadline Monitor: proactive deadline reminders ---
+        self.scheduler.add_job(
+            self.foia_deadline_monitor.run_check,
+            "interval",
+            minutes=FOIA_DEADLINE_CHECK_INTERVAL_MIN,
+            id="foia_deadline_check",
+            replace_existing=True,
+        )
+
+        # --- Watched Topic Scanner: proactive web monitoring ---
+        if WATCHED_TOPIC_SCAN_INTERVAL_MIN > 0:
+            self.scheduler.add_job(
+                self._run_watched_topic_scan,
+                "interval",
+                minutes=WATCHED_TOPIC_SCAN_INTERVAL_MIN,
+                id="watched_topic_scan",
+                replace_existing=True,
+            )
+
         self.scheduler.start()
         logger.info(
-            "Scheduler started. Heartbeat: every %d min | Dream cycle: daily at %02d:%02d UTC.",
+            "Scheduler started. Heartbeat: every %d min | Dream cycle: daily at %02d:%02d UTC "
+            "| FOIA deadline check: every %d min.",
             HEARTBEAT_INTERVAL_MIN,
             DREAM_HOUR_UTC,
             DREAM_MINUTE_UTC,
+            FOIA_DEADLINE_CHECK_INTERVAL_MIN,
         )
 
     # ------------------------------------------------------------------

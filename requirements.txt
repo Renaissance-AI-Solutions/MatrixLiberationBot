@@ -1,5 +1,5 @@
 # ============================================================
-# Liberation Bot — Python Dependencies (Agentic Phase I)
+# Liberation Bot — Python Dependencies (Phase II)
 # ============================================================
 
 # --- Matrix Client ---
@@ -28,6 +28,18 @@ openai>=1.35.0
 # Unofficial Python API for Google NotebookLM
 # Repo: https://github.com/teng-lin/notebooklm-py
 notebooklm-py>=0.3.3
+
+# --- Web Search (Tiered: DDG → Serper → Tavily) ---
+# Tier 1: DuckDuckGo (free, no API key required)
+duckduckgo-search>=6.3.7
+
+# Tier 2: Serper.dev (optional, requires SERPER_API_KEY)
+# requests is already a transitive dependency of many packages above;
+# listed explicitly for clarity.
+requests>=2.32.0
+
+# Tier 3: Tavily (optional, requires TAVILY_API_KEY)
+tavily-python>=0.5.0
 
 # --- Testing ---
 pytest==8.3.4

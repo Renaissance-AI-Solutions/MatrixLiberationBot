@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Shield, LogOut, RefreshCw, CheckCircle2, AlertTriangle, Clock,
   Plus, Trash2, Save, Loader2, User, Phone, Globe, FileText,
-  Bell, History, ChevronDown, ChevronUp, AlertCircle, Brain,
+  Bell, History, ChevronDown, ChevronUp, AlertCircle, Brain, Scale,
 } from 'lucide-react'
 import {
   profileApi, clearSession, isSessionValid, getMatrixId,
@@ -12,6 +12,7 @@ import {
 } from '../api'
 import type { Profile, EmergencyContact, SocialMedia, ReleaseAction } from '../api'
 import MemoryProfile from '../components/MemoryProfile'
+import FOIADashboard from '../components/FOIADashboard'
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -405,6 +406,11 @@ export default function Dashboard() {
               <Plus size={13} /> Add Release Action
             </button>
           </div>
+        </Section>
+
+        {/* ── FOIA Request Tracker ── */}
+        <Section title="FOIA Request Tracker" icon={Scale} defaultOpen={false}>
+          <FOIADashboard />
         </Section>
 
         {/* ── AI Memory Profile ── */}

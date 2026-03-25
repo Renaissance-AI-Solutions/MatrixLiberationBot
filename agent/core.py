@@ -72,6 +72,8 @@ from agent.tools import (
     UPSERT_MEMORY_TOOL_SCHEMA,
     get_dms_status,
     GET_DMS_STATUS_TOOL_SCHEMA,
+    tiered_search,
+    WEB_SEARCH_TOOL_SCHEMA,
 )
 
 logger = logging.getLogger(__name__)
@@ -162,6 +164,12 @@ Do NOT call this for conversational filler. Only save genuinely important new in
 - Whether their vault message, emergency contacts, or release actions are configured
 This tool is **read-only** — it cannot modify any DMS settings. To update settings, direct the member to the portal.
 
+**`web_search`** — Search the live web for current information. Use this when:
+- The Liberation Archives do not contain sufficiently current or specific information.
+- A member asks about recent news, new research, or current events related to Neurowarfare, AHIs, or FOIA developments.
+- You need to look up a specific agency contact, FOIA portal URL, or legal development.
+Always prefer the Liberation Archives for established, verified information. Use web_search as a supplement for recency and specificity. Cite sources from the results in your response.
+
 You also have access to:
 - **Recent room chat history** — the last 30 messages from this Matrix room (provided in every query)
 
@@ -223,7 +231,8 @@ class AgentCore:
         self.db = db
 
         # Register tools — memory and DMS tools only available when db is provided
-        self._tools = [LIBERATION_ARCHIVES_TOOL_SCHEMA]
+        # Web search is always available (uses free DDG tier by default)
+        self._tools = [LIBERATION_ARCHIVES_TOOL_SCHEMA, WEB_SEARCH_TOOL_SCHEMA]
         if self.db is not None:
             self._tools += [
                 SEARCH_MEMORIES_TOOL_SCHEMA,
@@ -454,6 +463,24 @@ class AgentCore:
                 sender_id=sender_id,
             )
 
+        elif tool_name == "web_search":
+            # Run the blocking tiered search in a thread pool to avoid blocking
+            # the asyncio event loop during DDG/Serper/Tavily HTTP calls.
+            query = tool_args.get("query", "")
+            max_results = int(tool_args.get("max_results", 5))
+            if not query:
+                return "[Error] web_search called with empty query."
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: tiered_search(query, max_results=max_results),
+            )
+            logger.info(
+                "web_search: query='%s' tier='%s' results=%d latency=%dms",
+                query, response.tier_used, len(response.results), response.latency_ms,
+            )
+            return response.format_for_agent()
+
         else:
             # This should never happen given the strict tool schema, but
             # we log it as a security event if it does.
@@ -464,7 +491,7 @@ class AgentCore:
             return (
                 f"[Security Restriction] Tool '{tool_name}' is not available. "
                 f"Permitted tools: query_liberation_archives, search_memories, "
-                f"upsert_memory, get_dms_status."
+                f"upsert_memory, get_dms_status, web_search."
             )
 
     # ------------------------------------------------------------------

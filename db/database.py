@@ -259,6 +259,10 @@ CREATE TABLE IF NOT EXISTS foia_requests (
 CREATE INDEX IF NOT EXISTS idx_foia_requests_sender_ts
     ON foia_requests(sender_id, created_ts DESC);
 
+-- Phase II lifecycle columns added via safe ALTER TABLE migrations
+-- (SQLite ignores duplicate column errors when using IF NOT EXISTS workaround)
+CREATE TABLE IF NOT EXISTS _foia_migration_lock (applied TEXT PRIMARY KEY);
+
 -- ============================================================
 -- [FOIA] FOIA Drafting Session Metadata
 -- Lightweight session log for auditing and debugging.
@@ -292,6 +296,7 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA_SQL)
         await self._conn.commit()
+        await self._apply_foia_lifecycle_migration()
         await self._purge_old_chat_history()
         logger.info("Database connected and schema initialised: %s", self.db_path)
 
@@ -1369,6 +1374,31 @@ class Database:
             logger.error("update_foia_request_status failed: %s", exc)
             return False
 
+    async def _apply_foia_lifecycle_migration(self) -> None:
+        """Idempotent migration: add Phase II lifecycle columns to foia_requests."""
+        migrations = [
+            ("foia_submitted_ts",       "ALTER TABLE foia_requests ADD COLUMN submitted_ts REAL"),
+            ("foia_expected_response",  "ALTER TABLE foia_requests ADD COLUMN expected_response_date REAL"),
+            ("foia_appeal_status",      "ALTER TABLE foia_requests ADD COLUMN appeal_status TEXT DEFAULT NULL"),
+            ("foia_appeal_letter",      "ALTER TABLE foia_requests ADD COLUMN appeal_letter TEXT"),
+        ]
+        for key, sql in migrations:
+            async with self._conn.execute(
+                "SELECT 1 FROM _foia_migration_lock WHERE applied = ?", (key,)
+            ) as cur:
+                already = await cur.fetchone()
+            if already:
+                continue
+            try:
+                await self._conn.execute(sql)
+                await self._conn.execute(
+                    "INSERT OR IGNORE INTO _foia_migration_lock (applied) VALUES (?)", (key,)
+                )
+                await self._conn.commit()
+                logger.info("FOIA migration applied: %s", key)
+            except Exception as exc:
+                logger.warning("FOIA migration skipped (%s): %s", key, exc)
+
     async def log_foia_session(
         self,
         sender_id: str,
@@ -1391,3 +1421,153 @@ class Database:
             await self._conn.commit()
         except Exception as exc:
             logger.error("log_foia_session failed for %s: %s", sender_id, exc)
+
+    async def mark_foia_submitted(
+        self,
+        request_id: int,
+        sender_id: str,
+        submitted_ts: float,
+        expected_response_date: float,
+    ) -> bool:
+        """
+        Record that a FOIA request has been physically submitted to the agency.
+        Sets submitted_ts, expected_response_date, and advances status to SUBMITTED.
+        Returns True on success.
+        """
+        try:
+            await self._conn.execute(
+                """
+                UPDATE foia_requests
+                SET submitted_ts = ?,
+                    expected_response_date = ?,
+                    status = 'SUBMITTED'
+                WHERE id = ? AND sender_id = ?
+                """,
+                (submitted_ts, expected_response_date, request_id, sender_id),
+            )
+            await self._conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("mark_foia_submitted failed for request %s: %s", request_id, exc)
+            return False
+
+    async def get_foia_requests_with_deadlines(
+        self,
+        sender_id: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return all SUBMITTED requests for a user that have an expected_response_date,
+        ordered by deadline ascending (soonest first).
+        """
+        async with self._conn.execute(
+            """
+            SELECT id, created_ts, submitted_ts, expected_response_date,
+                   jurisdiction_code, target_agency, subject_summary, status
+            FROM foia_requests
+            WHERE sender_id = ?
+              AND status = 'SUBMITTED'
+              AND expected_response_date IS NOT NULL
+            ORDER BY expected_response_date ASC
+            """,
+            (sender_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_all_overdue_foia_requests(self) -> List[Dict[str, Any]]:
+        """
+        Return all SUBMITTED requests across all users whose expected_response_date
+        has passed. Used by the deadline reminder scheduler.
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        async with self._conn.execute(
+            """
+            SELECT id, sender_id, jurisdiction_code, target_agency,
+                   subject_summary, submitted_ts, expected_response_date
+            FROM foia_requests
+            WHERE status = 'SUBMITTED'
+              AND expected_response_date IS NOT NULL
+              AND expected_response_date < ?
+            ORDER BY expected_response_date ASC
+            """,
+            (now,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_foia_requests_due_soon(
+        self,
+        within_seconds: float,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return SUBMITTED requests whose deadline falls within the next
+        `within_seconds` seconds. Used for proactive deadline reminders.
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        cutoff = now + within_seconds
+        async with self._conn.execute(
+            """
+            SELECT id, sender_id, jurisdiction_code, target_agency,
+                   subject_summary, submitted_ts, expected_response_date
+            FROM foia_requests
+            WHERE status = 'SUBMITTED'
+              AND expected_response_date IS NOT NULL
+              AND expected_response_date >= ?
+              AND expected_response_date <= ?
+            ORDER BY expected_response_date ASC
+            """,
+            (now, cutoff),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def save_foia_appeal(
+        self,
+        request_id: int,
+        sender_id: str,
+        appeal_letter: str,
+    ) -> bool:
+        """
+        Persist an appeal letter and advance status to APPEALED.
+        Returns True on success.
+        """
+        try:
+            await self._conn.execute(
+                """
+                UPDATE foia_requests
+                SET appeal_letter  = ?,
+                    appeal_status  = 'FILED',
+                    status         = 'APPEALED'
+                WHERE id = ? AND sender_id = ?
+                """,
+                (appeal_letter, request_id, sender_id),
+            )
+            await self._conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("save_foia_appeal failed for request %s: %s", request_id, exc)
+            return False
+
+    async def get_foia_requests_full_for_user(
+        self,
+        sender_id: str,
+        limit: int = 25,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return full foia_requests rows for the portal FOIA tab, including
+        lifecycle columns. Ordered newest-first.
+        """
+        async with self._conn.execute(
+            """
+            SELECT id, created_ts, confirmed_ts, submitted_ts,
+                   expected_response_date, jurisdiction_code, target_agency,
+                   subject_summary, status, appeal_status
+            FROM foia_requests
+            WHERE sender_id = ?
+            ORDER BY created_ts DESC
+            LIMIT ?
+            """,
+            (sender_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
