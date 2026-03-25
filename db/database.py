@@ -16,6 +16,8 @@ Tables:
   - user_memories        : [DREAM] Per-user long-term consolidated memories
   - operational_memories : [DREAM] Org-wide operational long-term memories
   - dream_cycles         : [DREAM] Audit log of Dream consolidation runs
+  - foia_requests        : [FOIA] Finalized FOIA request letters archive
+  - foia_sessions        : [FOIA] Active and historical drafting session metadata
 
 Security note: The agent has READ access to chat_history only.
 It cannot access emergency_vault, and all agent interactions are
@@ -225,6 +227,51 @@ CREATE TABLE IF NOT EXISTS dream_cycles (
     status                  TEXT NOT NULL DEFAULT 'RUNNING'
                                 CHECK(status IN ('RUNNING','SUCCESS','FAILED','SKIPPED')),
     error_note              TEXT
+);
+
+
+-- ============================================================
+-- [FOIA] FOIA Request Letters Archive
+-- Stores every finalized FOIA request letter drafted by members.
+-- Indexed by sender for the !foia_history command.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS foia_requests (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_ts              REAL NOT NULL,
+    confirmed_ts            REAL,
+    sender_id               TEXT NOT NULL,        -- Matrix user ID
+    room_id                 TEXT NOT NULL,
+    jurisdiction_code       TEXT NOT NULL,         -- e.g. 'FEDERAL', 'CA', 'NY'
+    target_agency           TEXT NOT NULL,
+    subject_summary         TEXT NOT NULL,
+    date_range              TEXT,
+    keywords                TEXT,
+    requester_name          TEXT NOT NULL,
+    requester_contact       TEXT NOT NULL,
+    fee_waiver_requested    INTEGER NOT NULL DEFAULT 0,
+    fee_waiver_justification TEXT,
+    expedited_requested     INTEGER NOT NULL DEFAULT 0,
+    expedited_justification TEXT,
+    draft_letter            TEXT NOT NULL,         -- Full text of the finalized letter
+    status                  TEXT NOT NULL DEFAULT 'DRAFT'
+                                CHECK(status IN ('DRAFT','FINALIZED','SUBMITTED','RESPONDED','APPEALED','CLOSED'))
+);
+CREATE INDEX IF NOT EXISTS idx_foia_requests_sender_ts
+    ON foia_requests(sender_id, created_ts DESC);
+
+-- ============================================================
+-- [FOIA] FOIA Drafting Session Metadata
+-- Lightweight session log for auditing and debugging.
+-- The full dialogue history is NOT stored here to protect privacy.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS foia_sessions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_ts          REAL NOT NULL,
+    ended_ts            REAL,
+    sender_id           TEXT NOT NULL,
+    room_id             TEXT NOT NULL,
+    final_state         TEXT,                 -- FINALIZED, CANCELLED, etc.
+    foia_request_id     INTEGER REFERENCES foia_requests(id) ON DELETE SET NULL
 );
 """
 
@@ -1202,3 +1249,145 @@ class Database:
         except Exception as exc:
             logger.error("get_dms_status failed for %s: %s", matrix_id, exc)
             return None
+
+    # ------------------------------------------------------------------
+    # [FOIA] FOIA Request Archive
+    # ------------------------------------------------------------------
+
+    async def save_foia_request(
+        self,
+        sender_id: str,
+        room_id: str,
+        jurisdiction_code: str,
+        target_agency: str,
+        subject_summary: str,
+        requester_name: str,
+        requester_contact: str,
+        draft_letter: str,
+        date_range: str = None,
+        keywords: str = None,
+        fee_waiver_requested: bool = False,
+        fee_waiver_justification: str = None,
+        expedited_requested: bool = False,
+        expedited_justification: str = None,
+        confirmed_ts: float = None,
+    ) -> Optional[int]:
+        """
+        Persist a finalized FOIA request letter to the archive.
+        Returns the new row ID on success, None on failure.
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        try:
+            async with self._conn.execute(
+                """
+                INSERT INTO foia_requests (
+                    created_ts, confirmed_ts, sender_id, room_id,
+                    jurisdiction_code, target_agency, subject_summary,
+                    date_range, keywords, requester_name, requester_contact,
+                    fee_waiver_requested, fee_waiver_justification,
+                    expedited_requested, expedited_justification,
+                    draft_letter, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'FINALIZED')
+                """,
+                (
+                    now, confirmed_ts or now, sender_id, room_id,
+                    jurisdiction_code, target_agency, subject_summary,
+                    date_range, keywords, requester_name, requester_contact,
+                    int(fee_waiver_requested), fee_waiver_justification,
+                    int(expedited_requested), expedited_justification,
+                    draft_letter,
+                ),
+            ) as cur:
+                await self._conn.commit()
+                return cur.lastrowid
+        except Exception as exc:
+            logger.error("save_foia_request failed for %s: %s", sender_id, exc)
+            return None
+
+    async def get_foia_requests_for_user(
+        self,
+        sender_id: str,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return the most recent `limit` FOIA requests for a user,
+        ordered newest-first.
+        """
+        async with self._conn.execute(
+            """
+            SELECT id, created_ts, confirmed_ts, jurisdiction_code,
+                   target_agency, subject_summary, date_range, status
+            FROM foia_requests
+            WHERE sender_id = ?
+            ORDER BY created_ts DESC
+            LIMIT ?
+            """,
+            (sender_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_foia_request_by_id(
+        self,
+        request_id: int,
+        sender_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return the full FOIA request record by ID.
+        The sender_id check ensures users can only retrieve their own requests.
+        """
+        async with self._conn.execute(
+            "SELECT * FROM foia_requests WHERE id = ? AND sender_id = ?",
+            (request_id, sender_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def update_foia_request_status(
+        self,
+        request_id: int,
+        sender_id: str,
+        status: str,
+    ) -> bool:
+        """
+        Update the status of a FOIA request.
+        Valid statuses: DRAFT, FINALIZED, SUBMITTED, RESPONDED, APPEALED, CLOSED.
+        Returns True on success.
+        """
+        valid_statuses = {"DRAFT", "FINALIZED", "SUBMITTED", "RESPONDED", "APPEALED", "CLOSED"}
+        if status not in valid_statuses:
+            logger.warning("Invalid FOIA status: %s", status)
+            return False
+        try:
+            await self._conn.execute(
+                "UPDATE foia_requests SET status = ? WHERE id = ? AND sender_id = ?",
+                (status, request_id, sender_id),
+            )
+            await self._conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("update_foia_request_status failed: %s", exc)
+            return False
+
+    async def log_foia_session(
+        self,
+        sender_id: str,
+        room_id: str,
+        started_ts: float,
+        final_state: str,
+        foia_request_id: Optional[int] = None,
+    ) -> None:
+        """Log a completed FOIA drafting session for audit purposes."""
+        now = datetime.now(timezone.utc).timestamp()
+        try:
+            await self._conn.execute(
+                """
+                INSERT INTO foia_sessions
+                    (started_ts, ended_ts, sender_id, room_id, final_state, foia_request_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (started_ts, now, sender_id, room_id, final_state, foia_request_id),
+            )
+            await self._conn.commit()
+        except Exception as exc:
+            logger.error("log_foia_session failed for %s: %s", sender_id, exc)

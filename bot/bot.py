@@ -59,6 +59,13 @@ from agent import AgentCore
 from agent.dreamer import DreamEngine
 from agent.tools import list_liberation_archives_topics
 from bot.video_room import VideoRoomHandler
+from bot.foia_session import FOIASessionManager, FOIASessionState
+from agent.foia_dialogue import FOIADialogueAgent
+from agent.tools.foia_jurisdictions import (
+    format_jurisdiction_summary,
+    format_federal_agencies_summary,
+    list_jurisdiction_codes,
+)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -142,6 +149,17 @@ HELP_TEXT = """
 - `@bot What legal options do AHI victims have in the US?`
 - `@bot Can you summarize the latest research on directed energy weapons?`
 
+**FOIA Request Generator (DM Commands):**
+- `!foia_start` — Begin a new FOIA/public records request drafting session.
+  Liberation Bot will guide you through the process step by step.
+- `!foia_jurisdictions` — List all supported jurisdictions (Federal + all 50 states).
+- `!foia_agencies` — List recommended federal agencies for AHI/Neurowarfare requests.
+- `!foia_preview` — Re-show your current draft letter at any time.
+- `!foia_revise <notes>` — Ask the bot to revise the draft based on your feedback.
+- `!foia_confirm` — Accept the draft and receive submission instructions.
+- `!foia_cancel` — Cancel the current drafting session.
+- `!foia_history` — Show your past finalized FOIA requests.
+
 **Video Planning Room (Video Planning and Generation room only):**
 - `!video_start` — Begin a new video planning session. Liberation Bot will lead a dialogue with the group, ask questions, and build the prompts automatically.
 - `!video_styles` — List all available visual styles and saved favourites.
@@ -152,6 +170,33 @@ HELP_TEXT = """
 - `!video_cancel` — Cancel the current session.
 - `!video_history` — Show recent completed videos.
 """
+
+
+# ---------------------------------------------------------------------------
+# FOIA helper — applies LLM-generated draft fields to a session object
+# ---------------------------------------------------------------------------
+
+def _apply_draft_to_session(session, draft: dict) -> None:
+    """
+    Write all fields from a submit_foia_draft tool call result into the
+    FOIASession dataclass. Called from both the confirm and revise handlers.
+    """
+    session.jurisdiction_code       = draft.get("jurisdiction_code") or session.jurisdiction_code
+    session.target_agency           = draft.get("target_agency") or session.target_agency
+    session.subject_summary         = draft.get("subject_summary") or session.subject_summary
+    session.date_range              = draft.get("date_range") or session.date_range
+    session.keywords                = draft.get("keywords") or session.keywords
+    session.requester_name          = draft.get("requester_name") or session.requester_name
+    session.requester_contact       = draft.get("requester_contact") or session.requester_contact
+    session.fee_waiver_requested    = bool(draft.get("fee_waiver_requested", session.fee_waiver_requested))
+    session.fee_waiver_justification = (
+        draft.get("fee_waiver_justification") or session.fee_waiver_justification
+    )
+    session.expedited_requested     = bool(draft.get("expedited_requested", session.expedited_requested))
+    session.expedited_justification = (
+        draft.get("expedited_justification") or session.expedited_justification
+    )
+    session.draft_letter            = draft.get("draft_letter") or session.draft_letter
 
 
 class LiberationBot:
@@ -198,6 +243,10 @@ class LiberationBot:
         # Maps matrix_id -> monotonic timestamp of their last successful query.
         # Cleared on bot restart (intentional — cooldowns don't need to survive restarts).
         self._user_last_query: dict[str, float] = {}
+
+        # --- FOIA subsystem (initialised in _init_modules after DB is ready) ---
+        self.foia_manager: Optional[FOIASessionManager] = None
+        self.foia_agent: Optional[FOIADialogueAgent] = None
 
         # --- Scheduler ---
         self.scheduler = AsyncIOScheduler()
@@ -304,6 +353,11 @@ class LiberationBot:
                 "MATRIX_VIDEO_ROOM_ID not set — video planning room disabled. "
                 "Add it to .env to enable the video workflow."
             )
+
+        # --- FOIA Session Manager and Dialogue Agent ---
+        self.foia_manager = FOIASessionManager()
+        self.foia_agent = FOIADialogueAgent()
+        logger.info("FOIA session manager and dialogue agent initialised.")
 
         logger.info("All sub-modules initialised.")
 
@@ -709,7 +763,322 @@ class LiberationBot:
             if self.video_handler:
                 await self.video_handler.handle_message(room, message)
 
-        # ---- DM: Onboarding conversation (catch-all for active sessions) ----
+        # ====================================================================
+        # FOIA Request Generator — DM Commands
+        # ====================================================================
+
+        # ---- DM: !foia_start ----
+        @self.bot.listener.on_message_event
+        async def on_foia_start(room, message):
+            match = botlib.MessageMatch(room, message, self.bot, prefix="!")
+            if (
+                match.is_not_from_this_bot()
+                and room.room_id != GROUP_ROOM_ID
+                and room.room_id != VIDEO_ROOM_ID
+                and match.prefix()
+                and match.command("foia_start")
+            ):
+                sender = message.sender
+                ok, result = self.foia_manager.start_session(room.room_id, sender)
+                if not ok:
+                    await self.bot.api.send_markdown_message(room.room_id, result)
+                    return
+                session = result
+                # Record session start time for audit log
+                session._started_ts = time.time()
+                # Get the opening message from the LLM agent
+                dialogue_result = await self.foia_agent.get_opening_message(session)
+                await self.bot.api.send_markdown_message(room.room_id, dialogue_result.reply)
+                await self.db.log_event(
+                    event_type="FOIA_SESSION_STARTED",
+                    actor_matrix_id=sender,
+                )
+
+        # ---- DM: !foia_jurisdictions ----
+        @self.bot.listener.on_message_event
+        async def on_foia_jurisdictions(room, message):
+            match = botlib.MessageMatch(room, message, self.bot, prefix="!")
+            if (
+                match.is_not_from_this_bot()
+                and room.room_id != GROUP_ROOM_ID
+                and room.room_id != VIDEO_ROOM_ID
+                and match.prefix()
+                and match.command("foia_jurisdictions")
+            ):
+                codes = list_jurisdiction_codes()
+                lines = [
+                    "## Supported Jurisdictions",
+                    "",
+                    "Use these codes when asked for your jurisdiction during a `!foia_start` session.",
+                    "",
+                    "| Code | Jurisdiction |",
+                    "|---|---|",
+                ]
+                for code in codes:
+                    from agent.tools.foia_jurisdictions import JURISDICTIONS
+                    name = JURISDICTIONS[code]["name"]
+                    lines.append(f"| `{code}` | {name} |")
+                lines += [
+                    "",
+                    "Use `!foia_agencies` to see recommended federal agencies for AHI requests.",
+                ]
+                await self.bot.api.send_markdown_message(room.room_id, "\n".join(lines))
+
+        # ---- DM: !foia_agencies ----
+        @self.bot.listener.on_message_event
+        async def on_foia_agencies(room, message):
+            match = botlib.MessageMatch(room, message, self.bot, prefix="!")
+            if (
+                match.is_not_from_this_bot()
+                and room.room_id != GROUP_ROOM_ID
+                and room.room_id != VIDEO_ROOM_ID
+                and match.prefix()
+                and match.command("foia_agencies")
+            ):
+                summary = format_federal_agencies_summary()
+                await self.bot.api.send_markdown_message(room.room_id, summary)
+
+        # ---- DM: !foia_preview ----
+        @self.bot.listener.on_message_event
+        async def on_foia_preview(room, message):
+            match = botlib.MessageMatch(room, message, self.bot, prefix="!")
+            if (
+                match.is_not_from_this_bot()
+                and room.room_id != GROUP_ROOM_ID
+                and room.room_id != VIDEO_ROOM_ID
+                and match.prefix()
+                and match.command("foia_preview")
+            ):
+                sender = message.sender
+                session = self.foia_manager.get_session(sender)
+                if not session:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        "No active FOIA drafting session. Use `!foia_start` to begin one.",
+                    )
+                    return
+                await self.bot.api.send_markdown_message(
+                    room.room_id, session.preview_text()
+                )
+
+        # ---- DM: !foia_revise <notes> ----
+        @self.bot.listener.on_message_event
+        async def on_foia_revise(room, message):
+            match = botlib.MessageMatch(room, message, self.bot, prefix="!")
+            if (
+                match.is_not_from_this_bot()
+                and room.room_id != GROUP_ROOM_ID
+                and room.room_id != VIDEO_ROOM_ID
+                and match.prefix()
+                and match.command("foia_revise")
+            ):
+                sender = message.sender
+                session = self.foia_manager.get_session(sender)
+                if not session:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        "No active FOIA drafting session. Use `!foia_start` to begin one.",
+                    )
+                    return
+                if session.state not in (
+                    FOIASessionState.REVIEW, FOIASessionState.DRAFTING
+                ):
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        "⚠️ Your session is not in a state that can be revised. "
+                        "Use `!foia_preview` to check the current status.",
+                    )
+                    return
+                args = match.args()
+                revision_notes = " ".join(args).strip() if args else ""
+                if not revision_notes:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        "Please provide revision notes. Example: `!foia_revise Please add a fee waiver request`",
+                    )
+                    return
+                # Reopen for revision if in REVIEW state
+                self.foia_manager.reopen_for_revision(sender)
+                await self.bot.api.send_markdown_message(
+                    room.room_id, "✏️ Revising your draft..."
+                )
+                dialogue_result = await self.foia_agent.process_revision(
+                    session, sender, revision_notes
+                )
+                # If a new draft was submitted, update the session
+                if dialogue_result.draft:
+                    _apply_draft_to_session(session, dialogue_result.draft)
+                    self.foia_manager.transition_to_review(sender)
+                await self.bot.api.send_markdown_message(
+                    room.room_id, dialogue_result.reply
+                )
+                if dialogue_result.draft:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id, session.preview_text()
+                    )
+
+        # ---- DM: !foia_confirm ----
+        @self.bot.listener.on_message_event
+        async def on_foia_confirm(room, message):
+            match = botlib.MessageMatch(room, message, self.bot, prefix="!")
+            if (
+                match.is_not_from_this_bot()
+                and room.room_id != GROUP_ROOM_ID
+                and room.room_id != VIDEO_ROOM_ID
+                and match.prefix()
+                and match.command("foia_confirm")
+            ):
+                sender = message.sender
+                session = self.foia_manager.get_session(sender)
+                if not session:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        "No active FOIA drafting session. Use `!foia_start` to begin one.",
+                    )
+                    return
+                if session.state != FOIASessionState.REVIEW:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        "⚠️ Your draft is not ready for confirmation yet. "
+                        "Continue the conversation until the bot presents the draft for review.",
+                    )
+                    return
+                if not session.is_complete:
+                    missing = ", ".join(session.missing_fields)
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        f"⚠️ The draft is still missing: **{missing}**. "
+                        "Please continue the conversation to fill in these details.",
+                    )
+                    return
+                # Finalize the session
+                finalized = self.foia_manager.finalize_session(sender)
+                if not finalized:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id, "⚠️ Could not finalize the session. Please try again."
+                    )
+                    return
+                # Save to DB
+                request_id = await self.db.save_foia_request(
+                    sender_id=sender,
+                    room_id=room.room_id,
+                    jurisdiction_code=session.jurisdiction_code,
+                    target_agency=session.target_agency,
+                    subject_summary=session.subject_summary,
+                    requester_name=session.requester_name,
+                    requester_contact=session.requester_contact,
+                    draft_letter=session.draft_letter,
+                    date_range=session.date_range,
+                    keywords=session.keywords,
+                    fee_waiver_requested=session.fee_waiver_requested,
+                    fee_waiver_justification=session.fee_waiver_justification,
+                    expedited_requested=session.expedited_requested,
+                    expedited_justification=session.expedited_justification,
+                    confirmed_ts=(
+                        session.confirmed_at.timestamp()
+                        if session.confirmed_at else None
+                    ),
+                )
+                session._db_id = request_id
+                # Log the session audit record
+                await self.db.log_foia_session(
+                    sender_id=sender,
+                    room_id=room.room_id,
+                    started_ts=getattr(session, "_started_ts", time.time()),
+                    final_state="FINALIZED",
+                    foia_request_id=request_id,
+                )
+                await self.db.log_event(
+                    event_type="FOIA_REQUEST_FINALIZED",
+                    actor_matrix_id=sender,
+                    note=f"Agency: {session.target_agency} | Jurisdiction: {session.jurisdiction_code}",
+                )
+                # Send the finalized letter and submission instructions
+                await self.bot.api.send_markdown_message(
+                    room.room_id,
+                    f"```\n{session.draft_letter}\n```",
+                )
+                await self.bot.api.send_markdown_message(
+                    room.room_id, session.submission_instructions()
+                )
+
+        # ---- DM: !foia_cancel ----
+        @self.bot.listener.on_message_event
+        async def on_foia_cancel(room, message):
+            match = botlib.MessageMatch(room, message, self.bot, prefix="!")
+            if (
+                match.is_not_from_this_bot()
+                and room.room_id != GROUP_ROOM_ID
+                and room.room_id != VIDEO_ROOM_ID
+                and match.prefix()
+                and match.command("foia_cancel")
+            ):
+                sender = message.sender
+                session = self.foia_manager.get_session(sender)
+                response = self.foia_manager.cancel_session(sender)
+                if session:
+                    await self.db.log_foia_session(
+                        sender_id=sender,
+                        room_id=room.room_id,
+                        started_ts=getattr(session, "_started_ts", time.time()),
+                        final_state="CANCELLED",
+                    )
+                    await self.db.log_event(
+                        event_type="FOIA_SESSION_CANCELLED",
+                        actor_matrix_id=sender,
+                    )
+                await self.bot.api.send_markdown_message(room.room_id, response)
+
+        # ---- DM: !foia_history ----
+        @self.bot.listener.on_message_event
+        async def on_foia_history(room, message):
+            match = botlib.MessageMatch(room, message, self.bot, prefix="!")
+            if (
+                match.is_not_from_this_bot()
+                and room.room_id != GROUP_ROOM_ID
+                and room.room_id != VIDEO_ROOM_ID
+                and match.prefix()
+                and match.command("foia_history")
+            ):
+                sender = message.sender
+                requests = await self.db.get_foia_requests_for_user(sender, limit=10)
+                if not requests:
+                    await self.bot.api.send_markdown_message(
+                        room.room_id,
+                        "You have no finalized FOIA requests yet. "
+                        "Use `!foia_start` to draft your first one.",
+                    )
+                    return
+                lines = [
+                    "## Your FOIA Request History",
+                    "",
+                    "| # | Date | Jurisdiction | Agency | Subject | Status |",
+                    "|---|---|---|---|---|---|",
+                ]
+                from datetime import datetime, timezone as _tz
+                for req in requests:
+                    date_str = datetime.fromtimestamp(
+                        req["created_ts"], tz=_tz.utc
+                    ).strftime("%Y-%m-%d")
+                    subject_short = (req["subject_summary"] or "")[:40]
+                    if len(req["subject_summary"] or "") > 40:
+                        subject_short += "..."
+                    lines.append(
+                        f"| {req['id']} | {date_str} | `{req['jurisdiction_code']}` "
+                        f"| {req['target_agency']} | {subject_short} | {req['status']} |"
+                    )
+                lines += [
+                    "",
+                    "Use `@bot` to ask Liberation Bot about the status of your requests "
+                    "or next steps for any of the above.",
+                ]
+                await self.bot.api.send_markdown_message(room.room_id, "\n".join(lines))
+
+        # ====================================================================
+        # End FOIA Commands
+        # ====================================================================
+
+        # ---- DM: Onboarding + FOIA conversation (catch-all for active sessions) ----
         @self.bot.listener.on_message_event
         async def on_dm_conversation(room, message):
             if room.room_id == GROUP_ROOM_ID:
@@ -719,12 +1088,36 @@ class LiberationBot:
             sender = message.sender
             if sender == BOT_USER_ID:
                 return
-            # Only handle if there's an active onboarding session
+            body = message.body if hasattr(message, "body") else ""
+            # Skip commands — they are handled by dedicated handlers above
+            if body.startswith("!"):
+                return
+
+            # --- FOIA session: route free-text messages to the dialogue agent ---
+            if self.foia_manager and self.foia_manager.has_active_session(sender):
+                session = self.foia_manager.get_session(sender)
+                if session and session.state in (
+                    FOIASessionState.INTAKE, FOIASessionState.DRAFTING
+                ):
+                    dialogue_result = await self.foia_agent.process_message(
+                        session, sender, body
+                    )
+                    # If the LLM submitted a draft, apply it and transition to REVIEW
+                    if dialogue_result.draft:
+                        _apply_draft_to_session(session, dialogue_result.draft)
+                        self.foia_manager.transition_to_review(sender)
+                    await self.bot.api.send_markdown_message(
+                        room.room_id, dialogue_result.reply
+                    )
+                    # If a draft was just submitted, also show the preview
+                    if dialogue_result.draft:
+                        await self.bot.api.send_markdown_message(
+                            room.room_id, session.preview_text()
+                        )
+                    return  # Don't fall through to onboarding
+
+            # --- Onboarding session: route free-text messages to onboarding ---
             if self.onboarding.has_session(sender):
-                body = message.body
-                # Skip if it's a command (already handled above)
-                if body.startswith("!"):
-                    return
                 response = await self.onboarding.process_message(sender, body)
                 await self.bot.api.send_markdown_message(room.room_id, response)
 
